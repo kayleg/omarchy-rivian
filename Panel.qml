@@ -687,17 +687,28 @@ Panel {
       }
     }
 
-    // Three states and no more: green while the car is moving, plain while it
-    // is parked and awake, dimmed while it sleeps. The mark is monochrome the
-    // rest of the time on purpose, because a bar full of coloured glyphs is a
-    // bar you stop reading.
+    // Three states and no more: green while the car is moving, plain the rest
+    // of the time, faded when the widget cannot vouch for what it is showing.
+    // The mark is monochrome otherwise on purpose, because a bar full of
+    // coloured glyphs is a bar you stop reading.
     active: root.driving
     // Green rather than the shell's urgent red, which is what WidgetButton
     // reaches for by default. A car being driven is the ordinary use of a car,
     // not an alarm, and this is the same green as the panel's live dot so the
     // two agree about what it means.
     activeColor: root.liveGreen
-    dimmed: root.asleep || root.errorText !== ""
+    // Deliberately not dimmed for a sleeping car, though the Tesla widget this
+    // came from does exactly that. There it means something: a sleeping Tesla
+    // cannot be read without waking it, so the fade is telling you the panel
+    // is showing you the past. A sleeping Rivian is read exactly as well as an
+    // awake one, so the same fade would say nothing — and since a Rivian is
+    // asleep most of the time, it would say nothing almost permanently, at 45%
+    // opacity, which is just a hard-to-see icon.
+    //
+    // What is left is the case the fade was always for: the widget cannot
+    // vouch for what it is showing. Rivian unreachable, or a reading old
+    // enough that the car may well have moved since.
+    dimmed: root.errorText !== "" || root.stale
     tooltipText: {
       if (root.errorText !== "") return root.plain("Dude, where's my car? " + root.errorText)
       if (!root.hasReading) return "Dude, where's my car?"
