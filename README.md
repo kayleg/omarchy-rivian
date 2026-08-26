@@ -197,6 +197,24 @@ Crop to the panel and nothing else. Whatever is behind it is your desktop.
 Every assertion runs the real mapping over a saved gateway answer, so a
 renamed field fails a test rather than silently blanking a cell.
 
+## Uninstall
+
+```bash
+omarchy plugin remove kayleg.rivian
+```
+
+That removes the plugin and its bar entry. It does not remove what the plugin
+stored, which is deliberate — those are your credentials and your car's
+movements, and deleting them should be something you asked for:
+
+```bash
+rm -rf ~/.config/omarchy-rivian    # session tokens
+rm -rf ~/.cache/omarchy-rivian     # last known position, geocode and tile cache
+```
+
+`rivian logout` alone drops the tokens and leaves the caches, if you want to
+stay installed but signed out.
+
 ## Privacy
 
 Both `~/.config/omarchy-rivian` and `~/.cache/omarchy-rivian` are kept at mode
