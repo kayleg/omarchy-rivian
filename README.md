@@ -1,7 +1,7 @@
 # Rivian
 
 An [Omarchy](https://omarchy.org) bar widget for a Rivian. The bar shows the
-R1's face and nothing else. Click it and a panel comes down with a map of where
+compass and nothing else. Click it and a panel comes down with a map of where
 the car is, which way it is pointing, how full the battery is, how far that
 gets you, and the handful of things you actually end up wondering about a
 parked car.

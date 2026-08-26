@@ -23,7 +23,14 @@ Written for this plugin:
                                 its login and OTP flow, the vehicle-state
                                 query, and the mapping from Rivian's wire
                                 format onto the panel's reading
-    RivianMark.qml              the bar mark
+    RivianMark.qml              the bar mark, which draws Rivian's compass
+                                emblem. The outline is Rivian's trademark,
+                                reproduced here to identify a Rivian in a
+                                widget about one — the same footing on which
+                                omarchy-tesla draws Tesla's wordmark T. Vector
+                                taken from a public copy of the mark; the
+                                surrounding QML, the sizing and the optical
+                                scaling are this plugin's.
     manifest.json, tests/
 
 Field names for Rivian's undocumented app API came from the community's
@@ -31,4 +38,5 @@ unofficial documentation at https://rivian-api.kaedenb.org/ and from
 rivian-python-api (https://github.com/the-mace/rivian-python-api), Apache-2.0.
 No code from either is included here.
 
+Rivian and the Rivian compass emblem are trademarks of Rivian Automotive, Inc.
 Not affiliated with or endorsed by Rivian Automotive, Inc. or Tesla, Inc.
