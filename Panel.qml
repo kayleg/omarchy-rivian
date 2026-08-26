@@ -1225,10 +1225,9 @@ Panel {
         }
 
         Text {
-          visible: !root.signingIn
           textFormat: Text.PlainText
           width: parent.width
-          visible: root.openText !== ""
+          visible: !root.signingIn && root.openText !== ""
           text: root.openText
           wrapMode: Text.WordWrap
           font.family: root.fontFamily
@@ -1284,14 +1283,13 @@ Panel {
         }
 
         Text {
-          visible: !root.signingIn
           textFormat: Text.PlainText
           width: parent.width
           // Signing in has its own form now, so this is left with the errors
           // no form can fix: a gateway that is down, a reading that would not
           // parse. The hint is preferred when there is one because it says
           // what to do, and the raw error only when there is not.
-          visible: root.errorText !== "" && !root.needsLogin
+          visible: !root.signingIn && root.errorText !== "" && !root.needsLogin
           text: root.errorHint !== "" ? root.errorHint : root.plain(root.errorText)
           wrapMode: Text.WordWrap
           horizontalAlignment: Text.AlignHCenter
