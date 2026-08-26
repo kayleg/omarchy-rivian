@@ -27,10 +27,11 @@ Written for this plugin:
                                 emblem. The outline is Rivian's trademark,
                                 reproduced here to identify a Rivian in a
                                 widget about one — the same footing on which
-                                omarchy-tesla draws Tesla's wordmark T. Vector
-                                taken from a public copy of the mark; the
-                                surrounding QML, the sizing and the optical
-                                scaling are this plugin's.
+                                omarchy-tesla draws Tesla's wordmark T. The
+                                outline was traced from a public raster of the
+                                solid badge and verified against it to within
+                                antialiasing; the surrounding QML, the sizing
+                                and the optical scaling are this plugin's.
     manifest.json, tests/
 
 Field names for Rivian's undocumented app API came from the community's
