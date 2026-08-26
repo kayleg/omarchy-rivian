@@ -131,7 +131,17 @@ has_fixture() { [ -s "$(fixture_path)" ]; }
 
 # ---------------------------------------------------------------------- auth
 
-GQL_ERROR=""
+# Why a file and not a variable. Every call into `gql` happens inside a command
+# substitution — `list=$(vehicles_json)` — and a subshell cannot assign to its
+# parent. A plain variable here is written, read back as empty by the caller,
+# and every gateway failure arrives at the panel as the default "not signed in"
+# no matter what actually went wrong. The file survives the subshell.
+GQL_ERROR_FILE="$CACHE_DIR/last-error"
+: > "$GQL_ERROR_FILE" 2>/dev/null || GQL_ERROR_FILE="/dev/null"
+
+set_error() { printf '%s' "$1" > "$GQL_ERROR_FILE" 2>/dev/null || true; }
+gql_error() { cat "$GQL_ERROR_FILE" 2>/dev/null; }
+clear_error() { : > "$GQL_ERROR_FILE" 2>/dev/null || true; }
 
 # One GraphQL POST. Extra headers come in as arguments so the login sequence,
 # which has no session yet, can send exactly what it has.
@@ -151,7 +161,7 @@ gql() {
   response="${response%$'\n'*}"
 
   if [ "$status" != "200" ]; then
-    GQL_ERROR="gateway said $status"
+    set_error "gateway said $status"
     return 1
   fi
 
@@ -160,7 +170,7 @@ gql() {
   local errors
   errors=$(printf '%s' "$response" | jq -r '.errors[0].message // empty' 2>/dev/null)
   if [ -n "$errors" ]; then
-    GQL_ERROR="$errors"
+    set_error "$errors"
     return 1
   fi
 
@@ -211,7 +221,7 @@ cmd_login() {
   [ -n "$password" ] || die "no password given"
 
   local pair csrf app
-  pair=$(csrf_pair) || die "could not start a session: $GQL_ERROR"
+  pair=$(csrf_pair) || die "could not start a session: $(gql_error)"
   csrf=$(printf '%s' "$pair" | jq -r .csrf)
   app=$(printf '%s' "$pair" | jq -r .app)
 
@@ -223,7 +233,7 @@ cmd_login() {
   }')
 
   response=$(gql "$login_body" -H "Csrf-Token: $csrf" -H "A-Sess: $app") \
-    || die "login failed: $GQL_ERROR"
+    || die "login failed: $(gql_error)"
   password=""
 
   kind=$(printf '%s' "$response" | jq -r '.data.login.__typename // empty')
@@ -244,7 +254,7 @@ cmd_login() {
     }')
 
     response=$(gql "$otp_body" -H "Csrf-Token: $csrf" -H "A-Sess: $app") \
-      || die "the code was not accepted: $GQL_ERROR"
+      || die "the code was not accepted: $(gql_error)"
     response=$(printf '%s' "$response" | jq -c '{data: {login: .data.loginWithOTP}}')
   fi
 
@@ -283,7 +293,7 @@ cmd_logout() {
 readonly VEHICLES_QUERY='{"operationName":"getUserInfo","variables":{},"query":"query getUserInfo { currentUser { __typename id vehicles { __typename id name vin vehicle { __typename id vin modelYear make model } } } }"}'
 
 vehicles_json() {
-  signed_in || { GQL_ERROR="not signed in"; return 1; }
+  signed_in || { set_error "not signed in"; return 1; }
   api "$VEHICLES_QUERY" | jq -c '[.data.currentUser.vehicles[]? | {
     id: .id,
     vin: .vin,
@@ -295,7 +305,7 @@ vehicles_json() {
 
 cmd_vehicles() {
   local list
-  list=$(vehicles_json) || fail_json "$GQL_ERROR" "$(auth_hint)"
+  list=$(vehicles_json) || fail_json "$(gql_error)" "$(auth_hint)"
   printf '%s' "$list" | jq -r '.[] | "  \(.name)  \(.vin)  \(.year // "") \(.model)"' >&2
   printf '%s\n' "$list"
 }
@@ -315,7 +325,7 @@ auth_hint() {
   if ! signed_in; then
     printf 'run: %s login' "$0"
   else
-    case "$GQL_ERROR" in
+    case "$(gql_error)" in
       *[Uu]nauthor*|*[Ss]ession*|*401*|*403*) printf 'the session expired; run: %s login' "$0" ;;
       *) printf '' ;;
     esac
@@ -503,8 +513,9 @@ read_car() {
     fi
   fi
 
+  clear_error
   local list vehicle
-  list=$(vehicles_json) || { serve_cache_or_fail "$GQL_ERROR"; return $?; }
+  list=$(vehicles_json) || { serve_cache_or_fail "$(gql_error)"; return $?; }
   vehicle=$(pick_vehicle "$list")
   if [ -z "$vehicle" ]; then
     if [ -n "$VIN" ]; then
@@ -517,7 +528,7 @@ read_car() {
 
   local id raw
   id=$(printf '%s' "$vehicle" | jq -r .id)
-  raw=$(api "$(state_query "$id")") || { serve_cache_or_fail "$GQL_ERROR"; return $?; }
+  raw=$(api "$(state_query "$id")") || { serve_cache_or_fail "$(gql_error)"; return $?; }
 
   local reading
   reading=$(reading_json "$raw" \

@@ -54,6 +54,72 @@ check "locked null"   "null"    "$(read_field gateway-sparse.json miles .locked)
 check "no position"   "null"    "$(read_field gateway-sparse.json miles .lat)"
 check "no tyres"      "null"    "$(read_field gateway-sparse.json miles .tyres)"
 
+# A fake curl on PATH, so the paths that only exist when the gateway answers —
+# headers, caching, and what happens when it does not answer — are testable
+# without an account. These caught the bug where every gateway error reached
+# the panel as "not signed in", because $GQL_ERROR was assigned inside a
+# command substitution and could never escape it.
+echo "gateway"
+SHIM=$(mktemp -d)
+trap 'rm -rf "$SHIM"' EXIT
+mkdir -p "$SHIM/bin"
+export OMARCHY_RIVIAN_CONFIG_DIR="$SHIM/config" OMARCHY_RIVIAN_CACHE_DIR="$SHIM/cache"
+mkdir -p "$SHIM/config"
+echo '{"csrfToken":"CSRF123","appSessionToken":"APP456","userSessionToken":"USER789"}' \
+  > "$SHIM/config/session.json"
+
+shim() { # shim MODE
+  cat > "$SHIM/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" >> "$SHIM/args.txt"
+body=""; for ((i=1;i<=\$#;i++)); do [ "\${!i}" = "--data" ] && { j=\$((i+1)); body="\${!j}"; }; done
+case "$1" in
+  ok)
+    if [[ "\$body" == *getUserInfo* ]]; then
+      printf '%s\n200' '{"data":{"currentUser":{"vehicles":[{"id":"veh-1","name":"Rivvy","vin":"VIN1","vehicle":{"model":"R1S","modelYear":2025}}]}}}'
+    else printf '%s\n200' "\$(cat "$SHIM/state.json")"; fi ;;
+  http500)  printf '%s\n500' '{}' ;;
+  gqlerror) printf '%s\n200' '{"errors":[{"message":"UNAUTHENTICATED: session expired"}]}' ;;
+esac
+EOF
+  chmod +x "$SHIM/bin/curl"
+}
+run() { PATH="$SHIM/bin:$PATH" ./bin/rivian --units miles "$@"; }
+
+cp tests/fixtures/gateway-parked.json "$SHIM/state.json"
+rm -f "$SHIM/args.txt"; shim ok
+check "reading lands"   "179.6" "$(run car --force | jq -c .range)"
+check "named from list" '"Rivvy"' "$(run car --force | jq -c .name)"
+# All three session tokens must reach curl, or every call is anonymous.
+sent() { grep -qx "$1" "$SHIM/args.txt" && echo yes || echo no; }
+check "csrf header"   "yes" "$(sent 'Csrf-Token: CSRF123')"
+check "a-sess header" "yes" "$(sent 'A-Sess: APP456')"
+check "u-sess header" "yes" "$(sent 'U-Sess: USER789')"
+check "client name"   "yes" "$(sent 'Apollographql-Client-Name: com.rivian.ios.consumer-apollo-ios')"
+check "cached"       "false" "$(run car | jq -c .fresh)"
+check "force skips cache" "true" "$(run car --force | jq -c .fresh)"
+
+# A gateway that is down must not blank the panel: the last known position of
+# a parked car does not stop being true because the network went away.
+shim http500
+check "http error kept"  '"gateway said 500"' "$(run car --force | jq -c .error)"
+check "stale flagged"    "true"    "$(run car --force | jq -c .stale)"
+check "position held"    "37.7749" "$(run car --force | jq -c .lat)"
+check "still ok"         "true"    "$(run car --force | jq -c .ok)"
+
+# GraphQL answers 200 and puts the failure in the body, so the status code
+# alone proves nothing.
+shim gqlerror
+check "gql error kept" '"UNAUTHENTICATED: session expired"' "$(run car --force | jq -c .error)"
+
+# With nothing cached there is nothing to fall back to, and the hint has to
+# say what to do about it.
+rm -rf "$SHIM/cache"
+check "fails honestly" "false" "$(run car --force | jq -c .ok)"
+check "hints at login" "true"  "$(run car --force | jq -r '.hint | test("login")')"
+
+unset OMARCHY_RIVIAN_CONFIG_DIR OMARCHY_RIVIAN_CACHE_DIR
+
 echo "shell"
 check "syntax" "ok" "$(bash -n $RIVIAN 2>/dev/null && echo ok)"
 
