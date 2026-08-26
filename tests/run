@@ -59,6 +59,23 @@ check "no tyres"      "null"    "$(read_field gateway-sparse.json miles .tyres)"
 # without an account. These caught the bug where every gateway error reached
 # the panel as "not signed in", because $GQL_ERROR was assigned inside a
 # command substitution and could never escape it.
+# An R1S has no tailgate and no tonneau, and Rivian answers for hardware the
+# car does not have with "signal_not_available" rather than by omitting it.
+# Read as "not "closed" means open", that reported both permanently open on
+# every R1S ever sold.
+echo "an R1S, which has no tailgate and no tonneau"
+check "nothing open"    "[]"    "$(read_field gateway-r1s.json miles .open)"
+check "no phantom OTA"  "null"  "$(read_field gateway-r1s.json miles .software_available)"
+check "version still read" '"2026.23.0"' "$(read_field gateway-r1s.json miles .software)"
+# A door that really is open still has to be reported.
+check "real open door"  '["a door"]' \
+  "$(jq -c '.data.vehicleState.doorRearLeftClosed={value:"open"}' tests/fixtures/gateway-r1s.json \
+     | ./bin/rivian --units miles render | jq -c .open)"
+# And an update that really is waiting still has to be offered.
+check "real OTA offered" '"2026.34.00"' \
+  "$(jq -c '.data.vehicleState.otaAvailableVersion={value:"2026.34.00"}' tests/fixtures/gateway-r1s.json \
+     | ./bin/rivian --units miles render | jq -c .software_available)"
+
 echo "gateway"
 SHIM=$(mktemp -d)
 trap 'rm -rf "$SHIM"' EXIT

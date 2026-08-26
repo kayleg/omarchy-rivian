@@ -158,7 +158,6 @@ Panel {
   // bottom explains itself.
   property string errorHint: ""
 
-  readonly property bool signedIn: errorText === ""
   readonly property bool hasReading: reading !== null && reading.ok === true
   readonly property bool driving: hasReading && reading.driving === true
   readonly property bool charging: hasReading && reading.charging_now === true
@@ -472,7 +471,11 @@ Panel {
   }
 
   // Signed in: drop everything the form was holding and go and get a reading.
-  function signedIn() {
+  // Named for what it does, not for a state. An earlier `signedIn()` collided
+  // with a leftover `property bool signedIn` from the Tesla port: the property
+  // won, so calling it threw and the panel sat on the code box after a
+  // sign-in that had already succeeded.
+  function completeSignIn() {
     cancelSignIn()
     needsLogin = false
     if (!stateProc.running) stateProc.running = true
@@ -519,7 +522,7 @@ Panel {
           root.signInStage = "code"
           root.signInError = ""
         } else if (data.signedIn === true) {
-          root.signedIn()
+          root.completeSignIn()
         }
       }
     }
@@ -546,9 +549,14 @@ Panel {
           // A wrong code is worth staying on this step for. Rivian's own
           // wording is better than anything this panel could invent.
           root.signInError = data.error || "the code was not accepted"
+          // A code can also fail because it already worked and the sign-in it
+          // belonged to is finished — the failure then is "nothing is waiting
+          // for a code", and the right answer is not to show it. Ask what the
+          // session actually is; if it is good, the form closes on its own.
+          if (!stateProc.running) stateProc.running = true
           return
         }
-        if (data.signedIn === true) root.signedIn()
+        if (data.signedIn === true) root.completeSignIn()
       }
     }
   }

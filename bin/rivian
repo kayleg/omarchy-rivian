@@ -518,21 +518,27 @@ reading_json() {
      | v($s.gearStatus) as $gear
      | v($s.powerState) as $power
      | v($s.chargerState) as $charger
-     # A closure is open unless it says "closed". Reading it the other way
-     # round — open only when it says "open" — would call a field Rivian has
-     # stopped populating closed, and a widget that quietly stops mentioning
-     # the open frunk is worse than one that never mentioned it.
-     | (def shut($f): (v($f) // "closed") == "closed";
-        [(if (shut($s.doorFrontLeftClosed) and shut($s.doorFrontRightClosed)
-              and shut($s.doorRearLeftClosed) and shut($s.doorRearRightClosed))
-          then empty else "a door" end),
-         (if shut($s.closureFrunkClosed) then empty else "the frunk" end),
-         (if shut($s.closureLiftgateClosed) then empty else "the liftgate" end),
-         (if shut($s.closureTailgateClosed) then empty else "the tailgate" end),
-         (if shut($s.closureTonneauClosed) then empty else "the tonneau" end),
-         (if (shut($s.windowFrontLeftClosed) and shut($s.windowFrontRightClosed)
-              and shut($s.windowRearLeftClosed) and shut($s.windowRearRightClosed))
-          then empty else "a window" end)]) as $open
+     # "Open" is a positive assertion: only the word "open" means open.
+     #
+     # This read the other way round at first — open unless it says "closed" —
+     # on the theory that a field Rivian stopped populating should err towards
+     # mentioning a door rather than missing one. On a real car that theory is
+     # simply wrong. An R1S has no tailgate and no tonneau, and Rivian answers
+     # for both of them with "signal_not_available", so every R1S was told its
+     # tonneau and tailgate were open, permanently, from the first reading.
+     # Hardware the car does not have is the common case for these fields, not
+     # the rare one, and a warning that is always on is a warning nobody reads.
+     | (def ajar($f): (v($f) // "") == "open";
+        [(if (ajar($s.doorFrontLeftClosed) or ajar($s.doorFrontRightClosed)
+              or ajar($s.doorRearLeftClosed) or ajar($s.doorRearRightClosed))
+          then "a door" else empty end),
+         (if ajar($s.closureFrunkClosed) then "the frunk" else empty end),
+         (if ajar($s.closureLiftgateClosed) then "the liftgate" else empty end),
+         (if ajar($s.closureTailgateClosed) then "the tailgate" else empty end),
+         (if ajar($s.closureTonneauClosed) then "the tonneau" else empty end),
+         (if (ajar($s.windowFrontLeftClosed) or ajar($s.windowFrontRightClosed)
+              or ajar($s.windowRearLeftClosed) or ajar($s.windowRearRightClosed))
+          then "a window" else empty end)]) as $open
      # Rivian reports tyres as a judgement, not a pressure: each corner is OK,
      # low, or not currently known. There is no number to show, so the panel
      # gets the verdict and the count of corners that disagree with it.
@@ -601,7 +607,11 @@ reading_json() {
         brake_fluid_low: v($s.brakeFluidLow),
 
         software: v($s.otaCurrentVersion),
-        software_available: v($s.otaAvailableVersion),
+        # Rivian says "0.0.0" for "nothing waiting", which is not a version
+        # and must not be offered as one: compared naively it differs from
+        # whatever is installed, so it would show an update arrow forever.
+        software_available: (v($s.otaAvailableVersion)
+                             | if . == null or . == "" or . == "0.0.0" then null else . end),
         ota_status: v($s.otaStatus),
         ota_progress: v($s.otaInstallProgress),
         open: $open})'
@@ -685,6 +695,19 @@ serve_cache_or_fail() {
 }
 
 cmd_car() { read_car; }
+
+# The gateway's own answer, unmapped. This is the thing to run when a cell
+# says something the car does not: save it, pipe it through `render`, and the
+# difference between the two is the bug. It is also how you find out what a
+# field Rivian has never documented actually contains on your car.
+cmd_raw() {
+  local list vehicle id
+  list=$(vehicles_json) || fail_json "$(gql_error)" "$(auth_hint)"
+  vehicle=$(pick_vehicle "$list")
+  [ -n "$vehicle" ] || fail_json "no car to read"
+  id=$(printf '%s' "$vehicle" | jq -r .id)
+  api "$(state_query "$id")" || fail_json "$(gql_error)" "$(auth_hint)"
+}
 
 # The mapping on its own, over a gateway answer on stdin. This is how the field
 # mapping is tested without an account, and it is the useful thing to run when
@@ -861,6 +884,7 @@ rivian: read one Rivian.
   vehicles                  the cars on the account, with their VINs
   state                     the summary the bar icon shows
   car [--force]             everything the panel shows
+  raw                       the gateway's own answer, unmapped
   render [NAME VIN MODEL YEAR]  map a saved gateway answer on stdin to a reading
   map LAT LON ZOOM W H      map tiles around a point, fetched and cached
   place LAT LON             that point as a street and a town
@@ -921,6 +945,7 @@ case "$command" in
   vehicles) cmd_vehicles ;;
   state)    cmd_state ;;
   car)      cmd_car ;;
+  raw)      cmd_raw ;;
   render)   cmd_render "$@" ;;
   map)      [ $# -eq 5 ] || die "map wants LAT LON ZOOM WIDTH HEIGHT"; cmd_map "$@" ;;
   place)    [ $# -eq 2 ] || die "place wants LAT LON"; cmd_place "$@" ;;
