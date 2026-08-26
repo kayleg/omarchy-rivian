@@ -72,7 +72,8 @@ shim() { # shim MODE
   cat > "$SHIM/bin/curl" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$@" >> "$SHIM/args.txt"
-body=""; for ((i=1;i<=\$#;i++)); do [ "\${!i}" = "--data" ] && { j=\$((i+1)); body="\${!j}"; }; done
+# The body arrives on stdin, not in argv — see the --data @- note in bin/rivian.
+body=\$(cat)
 case "$1" in
   ok)
     if [[ "\$body" == *getUserInfo* ]]; then
@@ -117,6 +118,73 @@ check "gql error kept" '"UNAUTHENTICATED: session expired"' "$(run car --force |
 rm -rf "$SHIM/cache"
 check "fails honestly" "false" "$(run car --force | jq -c .ok)"
 check "hints at login" "true"  "$(run car --force | jq -r '.hint | test("login")')"
+
+# Signing in, both legs, against a gateway that can be told to demand a code.
+echo "login"
+LSHIM=$(mktemp -d)
+trap 'rm -rf "$SHIM" "$LSHIM"' EXIT
+mkdir -p "$LSHIM/bin" "$LSHIM/config"
+export OMARCHY_RIVIAN_CONFIG_DIR="$LSHIM/config" OMARCHY_RIVIAN_CACHE_DIR="$LSHIM/cache"
+cat > "$LSHIM/bin/curl" <<EOF
+#!/usr/bin/env bash
+printf '%s\n' "\$@" > "$LSHIM/argv.txt"
+body=\$(cat)
+printf '%s' "\$body" >> "$LSHIM/bodies.txt"
+case "\$body" in
+  *CreateCSRFToken*) printf '%s\n200' '{"data":{"createCsrfToken":{"csrfToken":"C1","appSessionToken":"A1"}}}' ;;
+  *'"operationName":"Login"'*)
+     if [ -f "$LSHIM/mfa" ]; then printf '%s\n200' '{"data":{"login":{"__typename":"MobileMFALoginResponse","otpToken":"OTP-TOK"}}}'
+     else printf '%s\n200' '{"data":{"login":{"__typename":"MobileLoginResponse","accessToken":"AT","refreshToken":"RT","userSessionToken":"UT"}}}'; fi ;;
+  *LoginWithOTP*)
+     if [[ "\$body" == *'"otpCode":"999999"'* ]]; then printf '%s\n200' '{"errors":[{"message":"Invalid code"}]}'
+     else printf '%s\n200' '{"data":{"loginWithOTP":{"__typename":"MobileLoginResponse","accessToken":"AT2","refreshToken":"RT2","userSessionToken":"UT2"}}}'; fi ;;
+esac
+EOF
+chmod +x "$LSHIM/bin/curl"
+login() { PATH="$LSHIM/bin:$PATH" ./bin/rivian "$@"; }
+
+# An account with MFA off signs in on the first leg.
+rm -f "$LSHIM/mfa" "$LSHIM/config/session.json"
+check "no-mfa signs in" "true" "$(printf 'me@x.com\npw\n' | login login --stdin | jq -c .signedIn)"
+check "token stored"    '"UT"' "$(jq -c .userSessionToken "$LSHIM/config/session.json")"
+
+# An account with MFA on stops for a code, and says so rather than erroring.
+rm -f "$LSHIM/config/session.json"; touch "$LSHIM/mfa"
+check "mfa asks"        "true" "$(printf 'me@x.com\npw\n' | login login --stdin | jq -c .mfa)"
+check "pending noted"   "true" "$(login pending | jq -c .pending)"
+# The half-finished sign-in must not carry the password across the two legs.
+check "pending has no password" "no" \
+  "$(grep -q 'pw' "$LSHIM/config/pending-otp.json" && echo yes || echo no)"
+
+# Rivian's own rejection reaches the caller intact.
+check "bad code refused" "false" "$(printf '999999\n' | login otp --stdin | jq -c .ok)"
+check "bad code message" '"Invalid code"' "$(printf '999999\n' | login otp --stdin | jq -c .error)"
+check "still pending"    "true"  "$(login pending | jq -c .pending)"
+
+check "good code works"  "true"  "$(printf '123456\n' | login otp --stdin | jq -c .signedIn)"
+check "second token"     '"UT2"' "$(jq -c .userSessionToken "$LSHIM/config/session.json")"
+check "pending cleared"  "false" "$(login pending | jq -c .pending)"
+
+# Empty input must be refused rather than sent.
+check "empty refused"    "false" "$(printf '\n\n' | login login --stdin | jq -c .ok)"
+
+# The invariant that matters most: a password must never reach a command line,
+# because /proc/<pid>/cmdline is world-readable and would publish it to every
+# process on the machine for the life of the request.
+rm -f "$LSHIM/config/session.json" "$LSHIM/bodies.txt"
+printf 'me@x.com\nCANARYPW\n' | login login --stdin > /dev/null
+check "password not in argv" "no" \
+  "$(grep -q CANARYPW "$LSHIM/argv.txt" && echo yes || echo no)"
+check "password sent in body" "yes" \
+  "$(grep -q CANARYPW "$LSHIM/bodies.txt" && echo yes || echo no)"
+check "password not on disk" "no" \
+  "$(grep -rq CANARYPW "$LSHIM/config" 2>/dev/null && echo yes || echo no)"
+
+# logout takes the half-finished sign-in with it.
+touch "$LSHIM/mfa"; rm -f "$LSHIM/config/session.json"
+printf 'me@x.com\npw\n' | login login --stdin > /dev/null
+login logout 2>/dev/null
+check "logout clears pending" "false" "$(login pending | jq -c .pending)"
 
 unset OMARCHY_RIVIAN_CONFIG_DIR OMARCHY_RIVIAN_CACHE_DIR
 

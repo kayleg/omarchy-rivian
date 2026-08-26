@@ -209,6 +209,7 @@ Panel {
         // why it is the last known one.
         root.errorText = data.error || ""
         root.errorHint = data.hint || ""
+        root.noteNeedsLogin(data)
         if (data.ok !== true) return
 
         var was = root.carState
@@ -246,6 +247,7 @@ Panel {
         }
         root.errorText = data.error || ""
         root.errorHint = data.hint || ""
+        root.noteNeedsLogin(data)
         if (data.ok !== true) return
         root.reading = data
       }
@@ -370,6 +372,185 @@ Panel {
     browserProc.command = ["xdg-open", url]
     browserProc.running = true
     root.close()
+  }
+
+  // ------------------------------------------------------------- signing in
+
+  // Rivian has no OAuth flow and no token you can go and generate, so signing
+  // in means handing over the account's own email and password. That is worth
+  // doing as few times as possible and in as few places as possible, which is
+  // the argument for doing it here rather than in a terminal: one place, and
+  // one that can tell you what went wrong.
+  //
+  // Neither secret is ever an argument. `bin/rivian login --stdin` reads them
+  // off stdin, because everything on a command line appears in
+  // /proc/<pid>/cmdline, which any process on the machine can read. The same
+  // goes for the code. The password lives in a QML string for as long as it
+  // takes to write it down the pipe and is cleared in the same handler.
+  //
+  // "" when there is nothing to do, "credentials" for the email and password,
+  // "code" once Rivian has sent a one-time code.
+  property string signInStage: ""
+  property string signInError: ""
+  property string emailText: ""
+  property string passwordText: ""
+  property string codeText: ""
+
+  readonly property bool signingIn: signInStage !== ""
+  readonly property bool signInBusy: loginProc.running || otpProc.running
+  // The script says whether signing in is the fix, rather than the panel
+  // guessing it from the wording of an error.
+  property bool needsLogin: false
+
+  // Raise the form on the first answer that says the session is no good, and
+  // not again while it is already up: a poll landing mid-typing must not wipe
+  // the box under the cursor.
+  function noteNeedsLogin(data) {
+    var needs = data && data.needs_login === true
+    needsLogin = needs
+    if (needs && !signingIn && !signInBusy) beginSignIn()
+    // A session that came good again elsewhere — `rivian login` in a terminal
+    // — closes the form rather than leaving it stranded over a working car.
+    if (!needs && signingIn && !signInBusy) cancelSignIn()
+  }
+
+  function beginSignIn() {
+    // The stage is only set when `pending` answers, so a second poll arriving
+    // before it does would start a second one. Once is enough.
+    if (pendingProc.running) return
+    signInError = ""
+    passwordText = ""
+    codeText = ""
+    // A sign-in interrupted half way — panel closed after the code was sent —
+    // comes back to the code box rather than asking for the password again.
+    pendingProc.running = true
+  }
+
+  function cancelSignIn() {
+    signInStage = ""
+    signInError = ""
+    emailText = ""
+    passwordText = ""
+    codeText = ""
+  }
+
+  // Back to the email box, and the stashed OTP token goes with it. Separate
+  // from logout: there is no session yet at this point, so there is nothing
+  // to sign out of.
+  function restartSignIn() {
+    if (signInBusy) return
+    if (!cancelProc.running) cancelProc.running = true
+    signInStage = "credentials"
+    signInError = ""
+    codeText = ""
+    passwordText = ""
+  }
+
+  Process { id: cancelProc; command: root.cmd(["cancel"]) }
+
+  // Focus is handled by the fields themselves, as they become visible — the
+  // shell's own idiom for this, and the one that also covers a panel reopened
+  // onto a form that was already up.
+
+  function submitCredentials() {
+    if (signInBusy || emailText === "" || passwordText === "") return
+    signInError = ""
+    loginProc.email = emailText
+    loginProc.password = passwordText
+    passwordText = ""
+    loginProc.command = root.cmd(["login", "--stdin"])
+    loginProc.running = true
+  }
+
+  function submitCode() {
+    if (signInBusy || codeText === "") return
+    signInError = ""
+    otpProc.code = codeText
+    codeText = ""
+    otpProc.command = root.cmd(["otp", "--stdin"])
+    otpProc.running = true
+  }
+
+  // Signed in: drop everything the form was holding and go and get a reading.
+  function signedIn() {
+    cancelSignIn()
+    needsLogin = false
+    if (!stateProc.running) stateProc.running = true
+    root.refresh(true)
+  }
+
+  Process {
+    id: pendingProc
+    command: root.cmd(["pending"])
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var data
+        try { data = JSON.parse(text) } catch (e) { data = null }
+        root.signInStage = (data && data.pending === true) ? "code" : "credentials"
+      }
+    }
+  }
+
+  Process {
+    id: loginProc
+    property string email: ""
+    property string password: ""
+    stdinEnabled: true
+    onStarted: {
+      write(email + "\n" + password + "\n")
+      // Cleared the instant it is spent, so a panel left open is not a panel
+      // holding a password.
+      password = ""
+    }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var data
+        try {
+          data = JSON.parse(text)
+        } catch (e) {
+          root.signInError = "the sign-in helper said something unreadable"
+          return
+        }
+        if (data.ok !== true) {
+          root.signInError = data.error || "sign-in failed"
+          return
+        }
+        if (data.mfa === true) {
+          root.signInStage = "code"
+          root.signInError = ""
+        } else if (data.signedIn === true) {
+          root.signedIn()
+        }
+      }
+    }
+  }
+
+  Process {
+    id: otpProc
+    property string code: ""
+    stdinEnabled: true
+    onStarted: {
+      write(code + "\n")
+      code = ""
+    }
+    stdout: StdioCollector {
+      onStreamFinished: {
+        var data
+        try {
+          data = JSON.parse(text)
+        } catch (e) {
+          root.signInError = "the sign-in helper said something unreadable"
+          return
+        }
+        if (data.ok !== true) {
+          // A wrong code is worth staying on this step for. Rivian's own
+          // wording is better than anything this panel could invent.
+          root.signInError = data.error || "the code was not accepted"
+          return
+        }
+        if (data.signedIn === true) root.signedIn()
+      }
+    }
   }
 
   // ------------------------------------------------------------------ wording
@@ -528,448 +709,597 @@ Panel {
 
   // ------------------------------------------------------------------- panel
 
-  PopupCard {
+  KeyboardPanel {
     id: popup
     anchorItem: button
     bar: root.bar
     owner: root
     open: root.opened
-    // Click, not hover: opening this fetches map tiles and possibly asks the
-    // car for a reading, so it should happen because you meant it rather than
-    // because the cursor crossed the bar.
-    triggerMode: "click"
     contentWidth: popup.fittedContentWidth(Style.space(root.panelWidth))
     contentHeight: popup.fittedContentHeight(content.implicitHeight)
+    // Primes keyboard focus when the panel maps, which is what makes a text
+    // field in here usable at all.
+    focusTarget: keyCatcher
 
-    Column {
-      id: content
+    // Wraps the content so Esc closes the panel. While the sign-in form is up
+    // it stands down entirely: PanelKeyCatcher takes keys before its children,
+    // so without `blocked` every letter typed into the email box would be read
+    // as a navigation shortcut instead of as text.
+    PanelKeyCatcher {
+      id: keyCatcher
       anchors.fill: parent
-      // Generous on purpose. This panel is read in glances rather than
-      // scanned, and every section in it answers a different question, so
-      // they want visible daylight between them rather than a tidy list.
-      spacing: Style.space(12)
+      blocked: root.signingIn
+      onCloseRequested: root.close()
 
-      // ------------------------------------------------------------- header
+      Column {
+        id: content
+        anchors.fill: parent
+        // Generous on purpose. This panel is read in glances rather than
+        // scanned, and every section in it answers a different question, so
+        // they want visible daylight between them rather than a tidy list.
+        spacing: Style.space(12)
 
-      Item {
-        width: parent.width
-        height: Math.max(title.implicitHeight, badge.height)
+        // ------------------------------------------------------------- header
 
-        // The plugin is called Rivian everywhere it is listed, because that
-        // is what you look for when you go hunting for it. The joke is here,
-        // at the top of the panel, where it is the actual question being asked.
-        PanelSectionHeader {
-          id: title
-          anchors.left: parent.left
-          anchors.verticalCenter: parent.verticalCenter
-          text: "DUDE, WHERE'S MY CAR?"
-          foreground: root.foreground
-          fontFamily: root.fontFamily
+        Item {
+          width: parent.width
+          height: Math.max(title.implicitHeight, badge.height)
+
+          // The plugin is called Rivian everywhere it is listed, because that
+          // is what you look for when you go hunting for it. The joke is here,
+          // at the top of the panel, where it is the actual question being asked.
+          PanelSectionHeader {
+            id: title
+            anchors.left: parent.left
+            anchors.verticalCenter: parent.verticalCenter
+            text: "DUDE, WHERE'S MY CAR?"
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+          }
+
+          Row {
+            id: badge
+            anchors.right: parent.right
+            anchors.verticalCenter: parent.verticalCenter
+            spacing: Style.space(4)
+
+            // No model name here. The panel is about one specific car and
+            // naming it on every glance is noise; the bar's tooltip says which
+            // one on the rare occasion that is the question.
+            Rectangle {
+              anchors.verticalCenter: parent.verticalCenter
+              width: Style.space(6)
+              height: width
+              radius: width / 2
+              // Green for reachable, whatever it is doing: driving and
+              // charging are both online, and the word beside the dot already
+              // says which. The dot answers one question only: is the car
+              // there to be asked.
+              color: root.errorText !== "" ? Color.urgent
+                   : root.asleep ? Color.muted
+                   : root.carState === "" ? root.foreground
+                   : root.charging ? root.chargeRed
+                   : root.liveGreen
+              opacity: root.asleep ? 0.7 : 1
+            }
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.verticalCenter: parent.verticalCenter
+              text: root.stateWord
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.caption
+              color: root.foreground
+              opacity: 0.7
+            }
+          }
         }
 
-        Row {
-          id: badge
-          anchors.right: parent.right
-          anchors.verticalCenter: parent.verticalCenter
-          spacing: Style.space(4)
+        // ----------------------------------------------------------- sign in
 
-          // No model name here. The panel is about one specific car and
-          // naming it on every glance is noise; the bar's tooltip says which
-          // one on the rare occasion that is the question.
-          Rectangle {
-            anchors.verticalCenter: parent.verticalCenter
-            width: Style.space(6)
-            height: width
-            radius: width / 2
-            // Green for reachable, whatever it is doing: driving and
-            // charging are both online, and the word beside the dot already
-            // says which. The dot answers one question only: is the car
-            // there to be asked.
-            color: root.errorText !== "" ? Color.urgent
-                 : root.asleep ? Color.muted
-                 : root.carState === "" ? root.foreground
-                 : root.charging ? root.chargeRed
-                 : root.liveGreen
-            opacity: root.asleep ? 0.7 : 1
+        // Shown instead of the car when there is no usable session, which is
+        // the only time this panel has nothing true to say about a car. It
+        // replaces the view rather than sitting above it, because a map of
+        // where the car was last week over a form asking who you are is two
+        // answers to different questions stacked on one another.
+        Column {
+          width: parent.width
+          visible: root.signingIn
+          spacing: Style.space(8)
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            wrapMode: Text.WordWrap
+            text: root.signInStage === "code"
+              ? "Rivian has sent a one-time code to your phone or email."
+              : "Rivian has no way to hand out an API token, so this signs in with the account's own email and password. They go to rivian.com and are not stored \u2014 only the session it hands back is kept."
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.bodySmall
+            color: root.foreground
+            opacity: 0.75
+          }
+
+          TextField {
+            id: emailField
+            width: parent.width
+            visible: root.signInStage === "credentials"
+            enabled: !root.signInBusy
+            placeholderText: "Email"
+            text: root.emailText
+            foreground: root.foreground
+            inputMethodHints: Qt.ImhEmailCharactersOnly | Qt.ImhNoAutoUppercase
+            onTextChanged: if (text !== root.emailText) root.emailText = text
+            onAccepted: passwordField.forceActiveFocus()
+            Keys.onEscapePressed: root.cancelSignIn()
+            onVisibleChanged: if (visible && root.emailText === "") Qt.callLater(forceActiveFocus)
+            Component.onCompleted: if (visible && root.emailText === "") Qt.callLater(forceActiveFocus)
+          }
+
+          TextField {
+            id: passwordField
+            width: parent.width
+            visible: root.signInStage === "credentials"
+            enabled: !root.signInBusy
+            placeholderText: "Password"
+            // The shell's own field masks on this flag; nothing here has to
+            // reimplement an echo mode.
+            password: true
+            text: root.passwordText
+            foreground: root.foreground
+            onTextChanged: if (text !== root.passwordText) root.passwordText = text
+            onAccepted: root.submitCredentials()
+            Keys.onEscapePressed: root.cancelSignIn()
+            // An email already filled in means the password is what is missing.
+            onVisibleChanged: if (visible && root.emailText !== "") Qt.callLater(forceActiveFocus)
+          }
+
+          TextField {
+            id: codeField
+            width: parent.width
+            visible: root.signInStage === "code"
+            enabled: !root.signInBusy
+            placeholderText: "Code"
+            text: root.codeText
+            foreground: root.foreground
+            inputMethodHints: Qt.ImhDigitsOnly
+            onTextChanged: if (text !== root.codeText) root.codeText = text
+            onAccepted: root.submitCode()
+            Keys.onEscapePressed: root.restartSignIn()
+            onVisibleChanged: if (visible) Qt.callLater(forceActiveFocus)
+            Component.onCompleted: if (visible) Qt.callLater(forceActiveFocus)
+          }
+
+          Row {
+            width: parent.width
+            spacing: Style.space(6)
+
+            readonly property int buttonWidth:
+              Math.floor((width - Style.space(6)) / 2)
+
+            Button {
+              width: parent.buttonWidth
+              text: root.signInBusy ? "Signing in\u2026"
+                  : root.signInStage === "code" ? "Verify" : "Sign in"
+              enabled: !root.signInBusy && (root.signInStage === "code"
+                ? root.codeText !== ""
+                : root.emailText !== "" && root.passwordText !== "")
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: root.signInStage === "code" ? root.submitCode()
+                                                     : root.submitCredentials()
+            }
+
+            Button {
+              // On the code step this abandons the half-finished sign-in and
+              // goes back to the email box, which is the only way out of a
+              // code that never arrives.
+              width: parent.buttonWidth
+              text: root.signInStage === "code" ? "Start over" : "Cancel"
+              enabled: !root.signInBusy
+              bordered: true
+              foreground: root.foreground
+              fontFamily: root.fontFamily
+              onClicked: {
+                if (root.signInStage === "code") {
+                  root.restartSignIn()
+                } else {
+                  root.cancelSignIn()
+                  root.close()
+                }
+              }
+            }
           }
 
           Text {
             textFormat: Text.PlainText
-            anchors.verticalCenter: parent.verticalCenter
-            text: root.stateWord
+            width: parent.width
+            visible: root.signInError !== ""
+            // Rivian's own wording, not a translation of it: "Invalid code" is
+            // both shorter and more trustworthy than anything invented here.
+            text: root.plain(root.signInError)
+            wrapMode: Text.WordWrap
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: Color.urgent
+          }
+        }
+
+        // ---------------------------------------------------------------- map
+
+        Rectangle {
+          visible: !root.signingIn
+          id: mapArea
+          width: parent.width
+          // Three to two rather than sixteen to nine. A map is read outwards
+          // from the middle, so at a narrow width the wide aspect spends the
+          // panel on horizon and leaves you two streets of context; the squarer
+          // one shows the block the car is parked on.
+          height: Math.round(width * 2 / 3)
+          radius: Style.space(6)
+          color: Qt.rgba(0, 0, 0, 0.35)
+          clip: true
+
+          MapView {
+            anchors.fill: parent
+            plan: root.mapPlan
+            lightMap: root.lightMap
+            heading: root.hasReading && root.reading.heading !== null ? root.reading.heading : 0
+            driving: root.driving
+            stale: root.stale
+            foreground: root.foreground
+            accent: root.liveAccent
+            fontFamily: root.fontFamily
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            anchors.centerIn: parent
+            visible: !root.hasPosition
+            text: root.errorText !== "" ? root.errorText
+                : root.hasReading ? "The car is not sharing its location"
+                : "Waiting for the car"
             font.family: root.fontFamily
             font.pixelSize: Style.font.caption
             color: root.foreground
-            opacity: 0.7
+            opacity: 0.6
+          }
+
+          // The map is the link. Where the car is and wanting to go there are
+          // the same thought, so there is nothing to aim at but what you are
+          // already looking at.
+          MouseArea {
+            anchors.fill: parent
+            enabled: root.hasPosition
+            cursorShape: Qt.PointingHandCursor
+            onClicked: root.openInMaps()
+          }
+
+          // No speed badge here any more. It said what the line under the map
+          // already says and what the status word above it already implies, and
+          // it did so on top of the one thing in the panel worth looking at.
+        }
+
+        // -------------------------------------------------------------- where
+
+        Column {
+          visible: !root.signingIn
+          width: parent.width
+          spacing: Style.space(2)
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            visible: root.place !== ""
+            text: root.place
+            elide: Text.ElideRight
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.body
+            color: root.foreground
+          }
+
+          // Above the summary rather than below it: the summary ends in how old
+          // the reading is, which is the last thing on the panel worth reading
+          // and so belongs last.
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            visible: root.etaText !== ""
+            text: root.etaText
+            elide: Text.ElideRight
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: root.liveAccent
+          }
+
+          Text {
+            textFormat: Text.PlainText
+            width: parent.width
+            text: root.summary
+            elide: Text.ElideRight
+            font.family: root.fontFamily
+            font.pixelSize: Style.font.caption
+            color: root.foreground
+            opacity: 0.65
           }
         }
-      }
 
-      // ---------------------------------------------------------------- map
+        PanelSeparator { width: parent.width; visible: !root.signingIn }
 
-      Rectangle {
-        id: mapArea
-        width: parent.width
-        // Three to two rather than sixteen to nine. A map is read outwards
-        // from the middle, so at a narrow width the wide aspect spends the
-        // panel on horizon and leaves you two streets of context; the squarer
-        // one shows the block the car is parked on.
-        height: Math.round(width * 2 / 3)
-        radius: Style.space(6)
-        color: Qt.rgba(0, 0, 0, 0.35)
-        clip: true
+        // -------------------------------------------------------------- stats
 
-        MapView {
-          anchors.fill: parent
-          plan: root.mapPlan
-          lightMap: root.lightMap
-          heading: root.hasReading && root.reading.heading !== null ? root.reading.heading : 0
-          driving: root.driving
-          stale: root.stale
-          foreground: root.foreground
-          accent: root.liveAccent
-          fontFamily: root.fontFamily
+        // Battery and range at the two ends of one line, with the bar spanning
+        // both underneath. Three columns of figures was the first arrangement
+        // and it only worked while the panel was wide: narrow it and each column
+        // is too tight to hold a big number and its unit without them colliding.
+        // Two figures and a full-width bar survives being made small, and reads
+        // better wide as well.
+        // The three read as one thing, so they are spaced as one thing. Left to
+        // the panel's own rhythm the figures floated a long way above their own
+        // bar and the block came apart.
+        Column {
+          visible: !root.signingIn
+          width: parent.width
+          spacing: Style.space(4)
+
+          // The bar first and the numbers under it. They used to sit above at
+          // display size, which made the battery the loudest thing on a panel
+          // whose subject is where the car is. The bar already carries the
+          // reading at a glance; the figures are there to be precise, not to
+          // shout.
+          Rectangle {
+            width: parent.width
+            height: Style.space(6)
+            radius: height / 2
+            color: Qt.rgba(1, 1, 1, 0.12)
+
+            Rectangle {
+              width: parent.width * Math.max(0, Math.min(1,
+                (root.hasReading && root.reading.battery !== null ? root.reading.battery : 0) / 100))
+              height: parent.height
+              radius: parent.radius
+              color: root.charging ? root.chargeRed : root.foreground
+              opacity: root.charging ? 1 : 0.8
+
+              Behavior on width {
+                NumberAnimation { duration: 400; easing.type: Easing.OutCubic }
+              }
+            }
+
+            // The charge limit is a notch rather than a third number on the
+            // line below: what you read off a bar is how far the fill is from
+            // the line, and the line only needs naming once.
+            Rectangle {
+              visible: root.hasReading && root.reading.charge_limit !== null
+              x: parent.width * Math.max(0, Math.min(1,
+                (root.hasReading && root.reading.charge_limit !== null ? root.reading.charge_limit : 100) / 100))
+                - width / 2
+              width: Math.max(1, Style.space(2))
+              height: parent.height
+              color: root.foreground
+              opacity: 0.5
+            }
+          }
+
+          // Charge on the left, what it is heading for in the middle, range on
+          // the right. The three ends of the same sentence, under the bar that
+          // draws it.
+          Item {
+            width: parent.width
+            height: batteryLabel.implicitHeight
+
+            Text {
+              textFormat: Text.PlainText
+              id: batteryLabel
+              anchors.left: parent.left
+              text: root.hasReading && root.reading.battery !== null
+                ? root.reading.battery + "%" : "\u2014"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              color: root.foreground
+            }
+
+            // Nothing in the middle. The charge limit lived here, centred
+            // between two aligned figures, which made it read as a third
+            // unrelated item and shifted about as the numbers changed width.
+            // The notch on the bar shows it, and the details grid names it.
+
+            Text {
+              textFormat: Text.PlainText
+              anchors.right: parent.right
+              text: root.hasReading && root.reading.range !== null
+                ? Math.round(root.reading.range) + " " + root.reading.range_unit : "\u2014"
+              font.family: root.fontFamily
+              font.pixelSize: Style.font.body
+              color: root.foreground
+            }
+          }
+        }
+
+        PanelSeparator { width: parent.width; visible: !root.signingIn }
+
+        // ------------------------------------------------------------ details
+
+        // The things you look up rather than watch. Two columns of label-over-
+        // value, because a label beside its value needs a leader line to stay
+        // readable at this width and a label above it needs nothing at all.
+        Grid {
+          id: detailGrid
+          width: parent.width
+          columns: 2
+          columnSpacing: Style.space(8)
+          rowSpacing: Style.space(10)
+
+          // Ordered by what you came for. Locked is what you check when you
+          // cannot find the car; software is trivia. Left as eight cells of
+          // equal weight in no particular order, nothing stood out because
+          // everything looked equally worth reading. Pairs are kept together
+          // across each row so the two halves explain each other.
+          // A null here is "the cloud has not heard", which is not the same as
+          // "no", and showing an em dash for it rather than "no" is the whole
+          // reason the script bothers to tell them apart.
+          Detail {
+            label: "locked"
+            value: !root.hasReading || root.reading.locked === null ? "\u2014"
+                 : root.reading.locked ? "yes" : "no"
+          }
+
+          Detail {
+            // Rivian's answer to Sentry Mode, and it is called Gear Guard on the
+            // car's own screen, so it is called that here.
+            label: "gear guard"
+            value: !root.hasReading || root.reading.gear_guard === null ? "\u2014"
+                 : root.reading.gear_guard ? "armed" : "off"
+          }
+
+          Detail {
+            label: "odometer"
+            value: root.hasReading && root.reading.odometer !== null
+              ? Number(root.reading.odometer).toLocaleString(Qt.locale(), "f", 0)
+                + " " + root.reading.range_unit
+              : "\u2014"
+          }
+
+          Detail {
+            label: "tyres"
+            // Rivian reports a verdict per corner rather than a pressure, so
+            // there is no number to show and no spread to read off. "OK" or the
+            // count that disagrees is the whole of what it knows.
+            value: {
+              if (!root.hasReading || !root.reading.tyres) return "\u2014"
+              var t = root.reading.tyres
+              if (t.known === 0) return "\u2014"
+              return t.low === 0 ? "OK" : t.low + " low"
+            }
+          }
+
+          Detail {
+            label: "inside"
+            value: root.hasReading && root.reading.inside_temp !== null
+              ? root.reading.inside_temp + " " + root.reading.temp_unit : "\u2014"
+          }
+
+          // Rivian reports no outside temperature, so the cell that would have
+          // held it holds the thing this API has and Tesla's does not: when the
+          // car last spoke to the cloud. On a reading that is answering for a
+          // car in a basement, this is the only field that says so.
+          Detail {
+            label: "last heard"
+            value: {
+              if (!root.hasReading || !root.reading.last_sync) return "\u2014"
+              var t = Date.parse(root.reading.last_sync)
+              return isNaN(t) ? "\u2014" : root.agoOf((root.now - t) / 1000)
+            }
+          }
+
+          Detail {
+            label: "charge limit"
+            value: root.hasReading && root.reading.charge_limit !== null
+              ? root.reading.charge_limit + "%" : "\u2014"
+          }
+
+          Detail {
+            label: "plugged in"
+            value: !root.hasReading ? "\u2014" : root.reading.plugged ? "yes" : "no"
+          }
+
+          Detail {
+            label: "drive mode"
+            value: root.hasReading && root.reading.drive_mode
+              ? String(root.reading.drive_mode).replace(/_/g, " ") : "\u2014"
+          }
+
+          Detail {
+            label: "software"
+            // An update waiting is worth the arrow; which version it is is not,
+            // and would not fit anyway.
+            value: {
+              if (!root.hasReading || !root.reading.software) return "\u2014"
+              var v = String(root.reading.software)
+              return root.reading.software_available
+                  && root.reading.software_available !== root.reading.software
+                ? v + " \u2191" : v
+            }
+          }
         }
 
         Text {
+          visible: !root.signingIn
           textFormat: Text.PlainText
-          anchors.centerIn: parent
-          visible: !root.hasPosition
-          text: root.errorText !== "" ? root.errorText
-              : root.hasReading ? "The car is not sharing its location"
-              : "Waiting for the car"
+          width: parent.width
+          visible: root.openText !== ""
+          text: root.openText
+          wrapMode: Text.WordWrap
+          font.family: root.fontFamily
+          font.pixelSize: Style.font.bodySmall
+          color: Color.urgent
+        }
+
+        PanelSeparator { width: parent.width; visible: !root.signingIn }
+
+        // ------------------------------------------------------------ actions
+
+        Row {
+          visible: !root.signingIn
+          id: actions
+          width: parent.width
+          spacing: Style.space(6)
+
+          // Split evenly rather than sized to their labels: at this width three
+          // buttons hugging their text leave a ragged gap on the right, and a
+          // row of equal buttons is easier to hit besides.
+          readonly property int count: 2
+          readonly property int buttonWidth:
+            Math.floor((width - Style.space(6) * (count - 1)) / count)
+
+          Button {
+            width: actions.buttonWidth
+            text: "Open in maps"
+            enabled: root.hasPosition
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.openInMaps()
+          }
+
+          Button {
+            // The cost goes in the tooltip rather than the label, and in as few
+            // words as it takes: a tooltip long enough to be a sentence is one
+            // nobody finishes. "Keeps awake" rather than "wakes" because that is
+            // what happens: the button is disabled while the car is asleep, and
+            // the call behind it could not wake one if it were not.
+            // No cost to warn about in the tooltip, and no reason to disable it
+            // on a sleeping car: the cloud answers either way.
+            width: actions.buttonWidth
+            text: carProc.running ? "Asking\u2026" : "Refresh"
+            tooltipText: "Asks Rivian, not the car"
+            enabled: !carProc.running
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            onClicked: root.refresh(true)
+          }
+
+        }
+
+        Text {
+          visible: !root.signingIn
+          textFormat: Text.PlainText
+          width: parent.width
+          // Signing in has its own form now, so this is left with the errors
+          // no form can fix: a gateway that is down, a reading that would not
+          // parse. The hint is preferred when there is one because it says
+          // what to do, and the raw error only when there is not.
+          visible: root.errorText !== "" && !root.needsLogin
+          text: root.errorHint !== "" ? root.errorHint : root.plain(root.errorText)
+          wrapMode: Text.WordWrap
+          horizontalAlignment: Text.AlignHCenter
           font.family: root.fontFamily
           font.pixelSize: Style.font.caption
           color: root.foreground
           opacity: 0.6
         }
-
-        // The map is the link. Where the car is and wanting to go there are
-        // the same thought, so there is nothing to aim at but what you are
-        // already looking at.
-        MouseArea {
-          anchors.fill: parent
-          enabled: root.hasPosition
-          cursorShape: Qt.PointingHandCursor
-          onClicked: root.openInMaps()
-        }
-
-        // No speed badge here any more. It said what the line under the map
-        // already says and what the status word above it already implies, and
-        // it did so on top of the one thing in the panel worth looking at.
-      }
-
-      // -------------------------------------------------------------- where
-
-      Column {
-        width: parent.width
-        spacing: Style.space(2)
-
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width
-          visible: root.place !== ""
-          text: root.place
-          elide: Text.ElideRight
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.body
-          color: root.foreground
-        }
-
-        // Above the summary rather than below it: the summary ends in how old
-        // the reading is, which is the last thing on the panel worth reading
-        // and so belongs last.
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width
-          visible: root.etaText !== ""
-          text: root.etaText
-          elide: Text.ElideRight
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          color: root.liveAccent
-        }
-
-        Text {
-          textFormat: Text.PlainText
-          width: parent.width
-          text: root.summary
-          elide: Text.ElideRight
-          font.family: root.fontFamily
-          font.pixelSize: Style.font.caption
-          color: root.foreground
-          opacity: 0.65
-        }
-      }
-
-      PanelSeparator { width: parent.width }
-
-      // -------------------------------------------------------------- stats
-
-      // Battery and range at the two ends of one line, with the bar spanning
-      // both underneath. Three columns of figures was the first arrangement
-      // and it only worked while the panel was wide: narrow it and each column
-      // is too tight to hold a big number and its unit without them colliding.
-      // Two figures and a full-width bar survives being made small, and reads
-      // better wide as well.
-      // The three read as one thing, so they are spaced as one thing. Left to
-      // the panel's own rhythm the figures floated a long way above their own
-      // bar and the block came apart.
-      Column {
-        width: parent.width
-        spacing: Style.space(4)
-
-        // The bar first and the numbers under it. They used to sit above at
-        // display size, which made the battery the loudest thing on a panel
-        // whose subject is where the car is. The bar already carries the
-        // reading at a glance; the figures are there to be precise, not to
-        // shout.
-        Rectangle {
-          width: parent.width
-          height: Style.space(6)
-          radius: height / 2
-          color: Qt.rgba(1, 1, 1, 0.12)
-
-          Rectangle {
-            width: parent.width * Math.max(0, Math.min(1,
-              (root.hasReading && root.reading.battery !== null ? root.reading.battery : 0) / 100))
-            height: parent.height
-            radius: parent.radius
-            color: root.charging ? root.chargeRed : root.foreground
-            opacity: root.charging ? 1 : 0.8
-
-            Behavior on width {
-              NumberAnimation { duration: 400; easing.type: Easing.OutCubic }
-            }
-          }
-
-          // The charge limit is a notch rather than a third number on the
-          // line below: what you read off a bar is how far the fill is from
-          // the line, and the line only needs naming once.
-          Rectangle {
-            visible: root.hasReading && root.reading.charge_limit !== null
-            x: parent.width * Math.max(0, Math.min(1,
-              (root.hasReading && root.reading.charge_limit !== null ? root.reading.charge_limit : 100) / 100))
-              - width / 2
-            width: Math.max(1, Style.space(2))
-            height: parent.height
-            color: root.foreground
-            opacity: 0.5
-          }
-        }
-
-        // Charge on the left, what it is heading for in the middle, range on
-        // the right. The three ends of the same sentence, under the bar that
-        // draws it.
-        Item {
-          width: parent.width
-          height: batteryLabel.implicitHeight
-
-          Text {
-            textFormat: Text.PlainText
-            id: batteryLabel
-            anchors.left: parent.left
-            text: root.hasReading && root.reading.battery !== null
-              ? root.reading.battery + "%" : "\u2014"
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            color: root.foreground
-          }
-
-          // Nothing in the middle. The charge limit lived here, centred
-          // between two aligned figures, which made it read as a third
-          // unrelated item and shifted about as the numbers changed width.
-          // The notch on the bar shows it, and the details grid names it.
-
-          Text {
-            textFormat: Text.PlainText
-            anchors.right: parent.right
-            text: root.hasReading && root.reading.range !== null
-              ? Math.round(root.reading.range) + " " + root.reading.range_unit : "\u2014"
-            font.family: root.fontFamily
-            font.pixelSize: Style.font.body
-            color: root.foreground
-          }
-        }
-      }
-
-      PanelSeparator { width: parent.width }
-
-      // ------------------------------------------------------------ details
-
-      // The things you look up rather than watch. Two columns of label-over-
-      // value, because a label beside its value needs a leader line to stay
-      // readable at this width and a label above it needs nothing at all.
-      Grid {
-        id: detailGrid
-        width: parent.width
-        columns: 2
-        columnSpacing: Style.space(8)
-        rowSpacing: Style.space(10)
-
-        // Ordered by what you came for. Locked is what you check when you
-        // cannot find the car; software is trivia. Left as eight cells of
-        // equal weight in no particular order, nothing stood out because
-        // everything looked equally worth reading. Pairs are kept together
-        // across each row so the two halves explain each other.
-        // A null here is "the cloud has not heard", which is not the same as
-        // "no", and showing an em dash for it rather than "no" is the whole
-        // reason the script bothers to tell them apart.
-        Detail {
-          label: "locked"
-          value: !root.hasReading || root.reading.locked === null ? "\u2014"
-               : root.reading.locked ? "yes" : "no"
-        }
-
-        Detail {
-          // Rivian's answer to Sentry Mode, and it is called Gear Guard on the
-          // car's own screen, so it is called that here.
-          label: "gear guard"
-          value: !root.hasReading || root.reading.gear_guard === null ? "\u2014"
-               : root.reading.gear_guard ? "armed" : "off"
-        }
-
-        Detail {
-          label: "odometer"
-          value: root.hasReading && root.reading.odometer !== null
-            ? Number(root.reading.odometer).toLocaleString(Qt.locale(), "f", 0)
-              + " " + root.reading.range_unit
-            : "\u2014"
-        }
-
-        Detail {
-          label: "tyres"
-          // Rivian reports a verdict per corner rather than a pressure, so
-          // there is no number to show and no spread to read off. "OK" or the
-          // count that disagrees is the whole of what it knows.
-          value: {
-            if (!root.hasReading || !root.reading.tyres) return "\u2014"
-            var t = root.reading.tyres
-            if (t.known === 0) return "\u2014"
-            return t.low === 0 ? "OK" : t.low + " low"
-          }
-        }
-
-        Detail {
-          label: "inside"
-          value: root.hasReading && root.reading.inside_temp !== null
-            ? root.reading.inside_temp + " " + root.reading.temp_unit : "\u2014"
-        }
-
-        // Rivian reports no outside temperature, so the cell that would have
-        // held it holds the thing this API has and Tesla's does not: when the
-        // car last spoke to the cloud. On a reading that is answering for a
-        // car in a basement, this is the only field that says so.
-        Detail {
-          label: "last heard"
-          value: {
-            if (!root.hasReading || !root.reading.last_sync) return "\u2014"
-            var t = Date.parse(root.reading.last_sync)
-            return isNaN(t) ? "\u2014" : root.agoOf((root.now - t) / 1000)
-          }
-        }
-
-        Detail {
-          label: "charge limit"
-          value: root.hasReading && root.reading.charge_limit !== null
-            ? root.reading.charge_limit + "%" : "\u2014"
-        }
-
-        Detail {
-          label: "plugged in"
-          value: !root.hasReading ? "\u2014" : root.reading.plugged ? "yes" : "no"
-        }
-
-        Detail {
-          label: "drive mode"
-          value: root.hasReading && root.reading.drive_mode
-            ? String(root.reading.drive_mode).replace(/_/g, " ") : "\u2014"
-        }
-
-        Detail {
-          label: "software"
-          // An update waiting is worth the arrow; which version it is is not,
-          // and would not fit anyway.
-          value: {
-            if (!root.hasReading || !root.reading.software) return "\u2014"
-            var v = String(root.reading.software)
-            return root.reading.software_available
-                && root.reading.software_available !== root.reading.software
-              ? v + " \u2191" : v
-          }
-        }
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        width: parent.width
-        visible: root.openText !== ""
-        text: root.openText
-        wrapMode: Text.WordWrap
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.bodySmall
-        color: Color.urgent
-      }
-
-      PanelSeparator { width: parent.width }
-
-      // ------------------------------------------------------------ actions
-
-      Row {
-        id: actions
-        width: parent.width
-        spacing: Style.space(6)
-
-        // Split evenly rather than sized to their labels: at this width three
-        // buttons hugging their text leave a ragged gap on the right, and a
-        // row of equal buttons is easier to hit besides.
-        readonly property int count: 2
-        readonly property int buttonWidth:
-          Math.floor((width - Style.space(6) * (count - 1)) / count)
-
-        Button {
-          width: actions.buttonWidth
-          text: "Open in maps"
-          enabled: root.hasPosition
-          bordered: true
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          onClicked: root.openInMaps()
-        }
-
-        Button {
-          // The cost goes in the tooltip rather than the label, and in as few
-          // words as it takes: a tooltip long enough to be a sentence is one
-          // nobody finishes. "Keeps awake" rather than "wakes" because that is
-          // what happens: the button is disabled while the car is asleep, and
-          // the call behind it could not wake one if it were not.
-          // No cost to warn about in the tooltip, and no reason to disable it
-          // on a sleeping car: the cloud answers either way.
-          width: actions.buttonWidth
-          text: carProc.running ? "Asking\u2026" : "Refresh"
-          tooltipText: "Asks Rivian, not the car"
-          enabled: !carProc.running
-          bordered: true
-          foreground: root.foreground
-          fontFamily: root.fontFamily
-          onClicked: root.refresh(true)
-        }
-
-      }
-
-      Text {
-        textFormat: Text.PlainText
-        width: parent.width
-        visible: root.errorText !== ""
-        text: root.errorText === "not signed in"
-          ? "Run  rivian login  once, in a terminal."
-          : root.errorHint !== "" ? root.errorHint : root.errorText
-        wrapMode: Text.WordWrap
-        horizontalAlignment: Text.AlignHCenter
-        font.family: root.fontFamily
-        font.pixelSize: Style.font.caption
-        color: root.foreground
-        opacity: 0.6
       }
     }
   }

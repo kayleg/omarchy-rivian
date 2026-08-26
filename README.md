@@ -18,14 +18,11 @@ less alike than they look.
 omarchy plugin add https://github.com/kayleg/omarchy-rivian.git --enable
 ```
 
-Then sign in:
-
-```bash
-~/.config/omarchy/plugins/kayleg.rivian/bin/rivian login
-```
-
 The widget lands in the right section of the bar. Move it with
 `omarchy bar move`, or from the bar's own settings panel.
+
+Click it and it will ask you to sign in, in the panel itself. There is nothing
+to run in a terminal.
 
 ## Signing in, and why it is worse than Tesla's
 
@@ -38,17 +35,31 @@ Tesla's real login page ever sees your password.
 
 **Rivian has no equivalent.** Its app API has no OAuth flow, no scoped API key,
 and no token you can go and generate. The only way in is to POST the account's
-own email and password to Rivian's gateway and answer a one-time code. So:
+own email and password to Rivian's gateway and answer a one-time code.
 
-- `rivian login` prompts for your email and password at a terminal, reads the
-  password with the echo off, sends it to `rivian.com`, and **never writes it
-  anywhere**. Only the tokens that come back are stored.
-- Tokens go in `~/.config/omarchy-rivian/session.json`, mode 600, in a
-  directory this script keeps at mode 700.
-- Rivian will send an OTP to your phone or email on each new login. Expect to
-  do this again every so often when the session lapses; `rivian login` is the
-  whole of the fix.
-- `rivian logout` deletes the tokens.
+The panel does that for you: open the widget while signed out and it shows an
+email box, a password box, then a box for the code Rivian sends. When the
+session lapses — it will, periodically — the same form comes back on its own.
+
+What happens to the two secrets:
+
+- **Neither is ever a command-line argument.** Everything in `argv` shows up in
+  `/proc/<pid>/cmdline`, which is world-readable: any process on the machine,
+  running as any user, can read the arguments of a running process. The panel
+  writes the password down a pipe to `bin/rivian`, which writes the request
+  body down another pipe to `curl`. Nothing that carries a secret is ever
+  visible in a process listing.
+- **The password is never written to disk**, and the QML clears its own copy in
+  the same handler that spends it.
+- **Tokens** go in `~/.config/omarchy-rivian/session.json`, mode 600, in a
+  directory kept at mode 700.
+- Between the password and the code, a `pending-otp.json` (also mode 600) holds
+  the email and Rivian's OTP token so the panel does not have to keep anything
+  itself. It is deleted the moment it is spent.
+- `rivian logout` deletes all of it.
+
+The terminal path still exists if you prefer it — `rivian login` prompts with
+the echo off and does exactly the same thing.
 
 This is a real downgrade in blast radius versus Tesla's arrangement, and no
 amount of care in this script changes the fact that your password transits it.
@@ -118,6 +129,8 @@ almost everybody; **Miles** and **Kilometres** override it.
 credential. It is useful on its own:
 
 ```bash
+rivian login           # sign in at a terminal, instead of in the panel
+rivian logout          # forget the tokens
 rivian vehicles        # the cars on the account, with their VINs
 rivian state           # the summary the bar shows
 rivian car             # everything the panel shows, as JSON
