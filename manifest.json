@@ -39,7 +39,7 @@
         "label": "Units",
         "options": ["Auto", "Miles", "Kilometres"],
         "defaultValue": "Auto",
-        "description": "Rivian reports metric on the wire whatever the car's own screen shows, and — unlike Tesla — does not say which the screen is set to, so there is nothing to follow and this has to be asked. Auto reads your locale, which is right for almost everybody."
+        "description": "Rivian reports metric on the wire whatever the car's own screen shows, and does not say which the screen is set to, so there is nothing to follow and this has to be asked. Auto reads your locale, which is right for almost everybody."
       },
       {
         "key": "mapStyle",
@@ -84,7 +84,7 @@
         "max": 60,
         "step": 1,
         "defaultValue": 5,
-        "description": "Minutes. Rivian answers this from its own cloud and the car is never involved, so unlike the equivalent Tesla setting this costs the battery nothing at any interval — it is politeness to Rivian's gateway and nothing more. It is what lights the bar icon."
+        "description": "Minutes. Rivian answers this from its own cloud and the car is never involved, so this costs the battery nothing at any interval — it is politeness to Rivian's gateway and nothing more. It is what lights the bar icon."
       },
       {
         "key": "mapsUrl",

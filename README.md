@@ -11,11 +11,8 @@ parked car.
 *A car that does not exist, parked somewhere it has never been — see
 [Screenshots](#screenshots) below.*
 
-It is a port of [omarchy-tesla](https://github.com/jankeesvw/omarchy-tesla) by
-Jankees van Woezik (MIT), which is where the map, the tile cache, the geocoding
-and most of the panel come from. The API layer underneath is new, and so is
-almost everything the API layer implies — see below, because the two cars are
-less alike than they look.
+Reading the car costs it nothing — see
+[It cannot flatten your battery](#it-cannot-flatten-your-battery).
 
 ## Install
 
@@ -29,18 +26,14 @@ The widget lands in the right section of the bar. Move it with
 Click it and it will ask you to sign in, in the panel itself. There is nothing
 to run in a terminal.
 
-## Signing in, and why it is worse than Tesla's
+## Signing in
 
-Read this part. It is the one place this plugin asks more of you than its
-Tesla counterpart, and you should decide about it on purpose.
+Read this part and decide about it on purpose.
 
-Tesla has an ecosystem of small apps that drive Tesla's own OAuth page and hand
-you back a refresh token. The Tesla widget takes that token, so nothing but
-Tesla's real login page ever sees your password.
-
-**Rivian has no equivalent.** Its app API has no OAuth flow, no scoped API key,
-and no token you can go and generate. The only way in is to POST the account's
-own email and password to Rivian's gateway and answer a one-time code.
+Rivian's app API has **no OAuth flow, no scoped API key, and no token you can go
+and generate**. The only way in is to POST the account's own email and password
+to Rivian's gateway and answer a one-time code. There is no arrangement in which
+a third-party tool never sees your password, because Rivian does not offer one.
 
 The panel does that for you: open the widget while signed out and it shows an
 email box, a password box, then a box for the code Rivian sends. When the
@@ -66,39 +59,26 @@ What happens to the two secrets:
 The terminal path still exists if you prefer it — `rivian login` prompts with
 the echo off and does exactly the same thing.
 
-This is a real downgrade in blast radius versus Tesla's arrangement, and no
-amount of care in this script changes the fact that your password transits it.
-If that is not a trade you want to make, this is the point to stop. Nothing
-below makes it better.
-
-Everything else about the arrangement is *better* than Tesla's, which is the
-next section.
+No amount of care in this script changes the fact that your password transits
+it. If that is not a trade you want to make, this is the point to stop.
 
 ## It cannot flatten your battery
 
-The Tesla widget is built around one constraint: Tesla's API has calls the car
-answers, those calls reset the car's sleep timer, and a widget that polls one
-every minute will quietly stop the car ever sleeping and flatten it over a week
-of standing still. Most of that plugin's design — the park throttle, the wake
-button, the "keeps the car awake ~15 min" warning on its refresh button — is
-that constraint showing through.
+**This widget never touches the car.** Rivian's vehicle pushes telemetry
+up to Rivian's cloud on its own schedule, and `vehicleState` reads that cloud.
+The car is not what answers. Every field comes back with its own `timeStamp`,
+and the connection reports its own `lastSync` — the shape of a cache, not of a
+live poll.
 
-**None of it applies here.** Rivian's vehicle pushes telemetry up to Rivian's
-cloud on its own schedule, and `vehicleState` reads that cloud. The car is not
-what answers. Every field comes back with its own `timeStamp` and the
-connection reports its own `lastSync`, which is the shape of a cache and not of
-a live poll.
+So there is no wake command, no sleep policy, and no throttle protecting the
+battery, because there is nothing here that could drain one. Turn
+`statePollMinutes` down to 1 if you like; it costs the car nothing. The reuse
+window in the script is politeness to Rivian's gateway and nothing more.
 
-So there is no wake command in `bin/rivian`, no sleep policy, no park throttle,
-and no warning on the Refresh button, because there is nothing to warn about.
-Turn `statePollMinutes` down to 1 if you like; it costs the car nothing. The
-reuse window in the script is politeness to Rivian's gateway and nothing more.
-
-The thing you *do* give up is any guarantee of freshness. A car parked in an
+What you give up instead is any guarantee of freshness. A car parked in an
 underground car park has not moved, but nor has anything about it been heard,
 and from here those two look identical. That is what the panel's **last heard**
-cell is for, and why it earns a spot the Tesla panel spends on outside
-temperature.
+cell is for.
 
 ## What it shows
 
@@ -114,18 +94,21 @@ temperature.
 | Odometer, drive mode, software | with an ↑ when an update is waiting |
 | Last heard | when the cloud last got anything from the car |
 
-Some things Tesla's API has and Rivian's does not, so the panel does not
-pretend to them: **charger power in kW**, **outside temperature**, and the
-**active navigation route** with its destination and arrival time. Rivian does
-expose trip planning through a separate endpoint, but a route you asked a
-server to plan is not the route the car is driving, and showing the first as
-the second would be a lie in a small font.
+Rivian's API does not expose **charger power in kW**, **outside temperature**,
+or the **active navigation route**, so the panel does not pretend to them.
+Rivian does expose trip planning through a separate endpoint, but a route you
+asked a server to plan is not the route the car is driving, and showing the
+first as the second would be a lie in a small font.
+
+It is read-only. Vehicle commands need a phone key whose one-time in-vehicle
+pairing has not been worked out for Gen2 (2025+) cars, so there is nothing here
+that locks, unlocks or preconditions anything.
 
 ## Units
 
 Rivian reports metric on the wire whatever the car's own screen is set to, and
-unlike Tesla it does not report which the screen shows — so there is nothing to
-follow and it has to be a setting. **Auto** reads your locale and is right for
+does not say which the screen shows — so there is nothing to follow and it has
+to be a setting. **Auto** reads your locale and is right for
 almost everybody; **Miles** and **Kilometres** override it.
 
 ## The CLI
