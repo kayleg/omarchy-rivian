@@ -1412,6 +1412,20 @@ Panel {
       return "asleep"
     }
 
+    // Open and close the panel without a mouse. Mainly so a screenshot of it
+    // can be taken from a script — with a fixture in place, that produces a
+    // picture of a car that does not exist, which is the only kind that
+    // belongs in a public listing.
+    function open(): string {
+      if (!root.opened) root.toggle()
+      return "opened"
+    }
+
+    function close(): string {
+      if (root.opened) root.close()
+      return "closed"
+    }
+
     // Back to whatever the car actually says, so a test never leaves the panel
     // lying about a real car.
     function live(): string {
