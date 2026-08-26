@@ -574,8 +574,12 @@ reading_json() {
         speed_unit: $speed,
         drive_mode: v($s.driveMode),
 
-        battery: v($s.batteryLevel),
-        charge_limit: v($s.batteryLimit),
+        # Rivian reports these as floats, and a real car answers 46.600002.
+        # Rounded here rather than in the panel so nothing downstream has to
+        # remember: a battery percentage to six decimal places is noise, and
+        # the actionable number on this panel is the range underneath it.
+        battery: (v($s.batteryLevel) | if . == null then null else round end),
+        charge_limit: (v($s.batteryLimit) | if . == null then null else round end),
         charging: ($charger // "unknown"),
         plugged: ((v($s.chargerStatus) // "") | test("not_connected") | not),
         charging_now: (($charger // "") == "charging_active"),

@@ -63,6 +63,15 @@ check "no tyres"      "null"    "$(read_field gateway-sparse.json miles .tyres)"
 # car does not have with "signal_not_available" rather than by omitting it.
 # Read as "not "closed" means open", that reported both permanently open on
 # every R1S ever sold.
+# Rivian reports battery as a float; a real car answered 46.600002.
+echo "float battery"
+check "battery rounded" "47" \
+  "$(jq -c '.data.vehicleState.batteryLevel={value:46.600002}' tests/fixtures/gateway-parked.json \
+     | ./bin/rivian --units miles render | jq -c .battery)"
+check "limit rounded" "80" \
+  "$(jq -c '.data.vehicleState.batteryLimit={value:79.99999}' tests/fixtures/gateway-parked.json \
+     | ./bin/rivian --units miles render | jq -c .charge_limit)"
+
 echo "an R1S, which has no tailgate and no tonneau"
 check "nothing open"    "[]"    "$(read_field gateway-r1s.json miles .open)"
 check "no phantom OTA"  "null"  "$(read_field gateway-r1s.json miles .software_available)"
