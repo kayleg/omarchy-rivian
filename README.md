@@ -6,6 +6,11 @@ the car is, which way it is pointing, how full the battery is, how far that
 gets you, and the handful of things you actually end up wondering about a
 parked car.
 
+<img src="screenshots/panel-light.png" alt="The panel: a map of where the car is parked, battery and range, and a grid of details" width="320">
+
+*A car that does not exist, parked somewhere it has never been — see
+[Screenshots](#screenshots) below.*
+
 It is a port of [omarchy-tesla](https://github.com/jankeesvw/omarchy-tesla) by
 Jankees van Woezik (MIT), which is where the map, the tile cache, the geocoding
 and most of the panel come from. The API layer underneath is new, and so is
@@ -167,6 +172,39 @@ omarchy-shell kayleg.rivian.test live      # back to the real car
 run when Rivian renames a field: save what the gateway said, pipe it in, and
 the difference between the two is the bug.
 
+## Screenshots
+
+A picture of this widget is a picture of where your car is, which is not
+something to put in a README. The fixture mechanism exists partly for this: put
+a car that does not exist in front of the panel, photograph that, and take it
+away again.
+
+```bash
+# A fabricated car — invented VIN, generic name, parked on a public street.
+./bin/rivian render "Rivian" "7FCTGAAA0PN000000" "R1S" 2025 \
+  < tests/fixtures/gateway-demo.json > ~/.config/omarchy-rivian/fixture.json
+
+omarchy-shell kayleg.rivian.test live    # re-read, so the panel picks it up
+omarchy-shell kayleg.rivian.test open    # open it without a mouse
+
+grim -o YOUR-OUTPUT shot.png             # then crop to the panel
+
+omarchy-shell kayleg.rivian.test close
+rm ~/.config/omarchy-rivian/fixture.json # back to the real car
+omarchy-shell kayleg.rivian.test live
+```
+
+`gateway-demo.json` sets `cloudConnection.lastSync` to a fixed time, so "last
+heard" will read as however long ago that is. Restamp it first if you want it
+to look freshly synced:
+
+```bash
+jq -c --arg s "$(date -u -d '60 seconds ago' '+%Y-%m-%dT%H:%M:%S.000Z')" \
+  '.data.vehicleState.cloudConnection.lastSync=$s' tests/fixtures/gateway-demo.json | ...
+```
+
+Crop to the panel and nothing else. Whatever is behind it is your desktop.
+
 ## Tests
 
 ```bash
@@ -186,8 +224,9 @@ leaves the cache alone — delete it yourself if you want the history gone.
 
 Rivian learns what it was always going to learn. OpenStreetMap's Nominatim
 learns the coordinates, if `showAddress` is on; turn it off and nothing but
-Rivian knows where the car is. CARTO serves the map tiles and therefore sees
-roughly where you are looking, at tile resolution.
+Rivian knows where the car is. Esri serves the map tiles and therefore sees
+roughly where you are looking, at tile resolution; the same is true of
+OpenStreetMap if you pick that style.
 
 ## Unofficial
 

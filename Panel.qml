@@ -85,7 +85,7 @@ Panel {
     return (0.2126 * bg.r + 0.7152 * bg.g + 0.0722 * bg.b) > 0.5
   }
 
-  // CARTO's two basemaps are quiet enough to read a marker off and come in a
+  // The grey canvas basemaps are quiet enough to read a marker off and come in a
   // matched pair, which is the whole reason they are the default over OSM's
   // own: a dark map dropped into a light theme is a hole in the panel, and a
   // light one in a dark theme is a torch in the face. Auto follows the theme

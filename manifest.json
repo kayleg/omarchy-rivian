@@ -47,7 +47,7 @@
         "label": "Map",
         "options": ["Auto", "Dark", "Light", "OpenStreetMap"],
         "defaultValue": "Auto",
-        "description": "Auto follows your theme: a light theme gets CARTO's light basemap, a dark one gets its dark basemap. Both are quiet enough to read a marker off, which is why they beat OpenStreetMap's own standard style here. That one is the map everybody recognises, and considerably louder behind a marker."
+        "description": "Auto follows your theme: a light theme gets Esri's light grey canvas, a dark one gets the dark. Both are deliberately quiet, which is why they beat OpenStreetMap's own standard style here — that one is the map everybody recognises, and considerably louder behind a marker."
       },
       {
         "key": "mapZoom",
