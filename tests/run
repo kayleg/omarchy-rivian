@@ -85,6 +85,21 @@ check "real OTA offered" '"2026.34.00"' \
   "$(jq -c '.data.vehicleState.otaAvailableVersion={value:"2026.34.00"}' tests/fixtures/gateway-r1s.json \
      | ./bin/rivian --units miles render | jq -c .software_available)"
 
+# Whoever drew the tiles has to be credited, and the credit has to follow the
+# provider actually in use.
+echo "tiles"
+cred() { ./bin/rivian --tile-url "$1" map 37.7793 -122.4193 16 8 8 2>/dev/null | jq -c .attribution; }
+check "esri credited" '"© Esri, HERE, Garmin, © OpenStreetMap contributors"' \
+  "$(cred 'https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}')"
+check "osm credited"  '"© OpenStreetMap contributors"' \
+  "$(cred 'https://tile.openstreetmap.org/{z}/{x}/{y}.png')"
+# CARTO now key-gates basemaps and signals it with an HTTP 200 nag PNG, so it
+# must not be what a default install points at.
+check "default is not carto" "no" \
+  "$(grep -q 'cartocdn' <(grep '^TILE_URL=' ./bin/rivian) && echo yes || echo no)"
+check "panel default not carto" "no" \
+  "$(grep -q 'cartocdn.*return' Panel.qml && echo yes || echo no)"
+
 echo "gateway"
 SHIM=$(mktemp -d)
 trap 'rm -rf "$SHIM"' EXIT

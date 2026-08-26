@@ -52,7 +52,7 @@ MIN_INTERVAL=30
 DRIVE_INTERVAL=10
 VIN=""
 UNITS="auto"
-TILE_URL="https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+TILE_URL="https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
 FORCE=0
 
 die() { printf 'rivian: %s\n' "$*" >&2; exit 1; }
@@ -799,20 +799,50 @@ cmd_map() {
   done < <(printf '%s' "$plan" | grep '^tile')
 
   jq -cn --argjson tiles "$tiles" --argjson w "$width" --argjson h "$height" \
+    --arg credit "$(tile_credit)" \
     --argjson cx "${car_x:-0}" --argjson cy "${car_y:-0}" --argjson z "$zoom" '
     {ok: true, width: $w, height: $h, zoom: $z, tileSize: 256,
      carX: $cx, carY: $cy, tiles: $tiles,
-     attribution: "© OpenStreetMap contributors © CARTO"}'
+     # Whoever drew the tiles has to be named, and which of them it is depends
+     # on the style in force, so the caller states it rather than this guessing
+     # from a URL.
+     attribution: $credit}'
 }
 
-# Tiles are immutable for practical purposes, so one that is on disk is never
-# fetched again. This is the whole of being a good guest on a free tile server.
+# Whoever drew the tiles has to be credited, and which of them it is depends on
+# the style in force.
+tile_credit() {
+  case "$TILE_URL" in
+    *arcgisonline*) printf '%s' "© Esri, HERE, Garmin, © OpenStreetMap contributors" ;;
+    *openstreetmap*) printf '%s' "© OpenStreetMap contributors" ;;
+    *cartocdn*) printf '%s' "© OpenStreetMap contributors © CARTO" ;;
+    *) printf '%s' "© OpenStreetMap contributors" ;;
+  esac
+}
+
+# How long a cached tile is trusted. Tiles are immutable for practical
+# purposes, so this is not about the map changing — it is about the tile
+# *server* changing. CARTO began requiring an API key and said so with an HTTP
+# 200 and a valid PNG reading "API KEY REQUIRED", which is indistinguishable
+# from a map to anything downstream. It cached like a map and the panel showed
+# a wall of nag tiles that would never have expired. A month means the worst
+# case for the next provider to do that is a month, not forever.
+TILE_MAX_AGE=$((30 * 86400))
+
+# A tile on disk and still in date is never fetched again. This is the whole of
+# being a good guest on a free tile server.
 fetch_tile() {
   local z="$1" x="$2" y="$3"
   local dir="$CACHE_DIR/tiles/$(printf '%s' "$TILE_URL" | md5sum | cut -c1-8)/$z/$x"
   local path="$dir/$y.png"
 
-  if [ -s "$path" ]; then printf '%s' "$path"; return 0; fi
+  if [ -s "$path" ]; then
+    local age
+    age=$(( $(now) - $(number_or "$(date -r "$path" +%s 2>/dev/null)" 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$TILE_MAX_AGE" ]; then
+      printf '%s' "$path"; return 0
+    fi
+  fi
 
   ( umask 077; mkdir -p "$dir" )
   local url="${TILE_URL//\{z\}/$z}"
@@ -905,7 +935,7 @@ Options:
   --vin VIN                 pick a car, when the account has more than one
   --units auto|miles|km     auto follows the locale (default)
   --min-interval SECONDS    how long a reading is reused (default 30)
-  --tile-url URL            {z}/{x}/{y} template for map tiles
+  --tile-url URL            {z}/{x}/{y} template for map tiles (Esri uses {z}/{y}/{x})
 EOF
 }
 

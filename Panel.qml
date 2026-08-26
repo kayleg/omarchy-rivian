@@ -94,10 +94,20 @@ Panel {
   readonly property string effectiveMapStyle:
     mapStyle === "Auto" ? (lightTheme ? "Light" : "Dark") : mapStyle
 
+  // Esri's grey canvas basemaps rather than CARTO's, which is not a style
+  // preference. CARTO began requiring an API key for basemaps.cartocdn.com and
+  // signals it in the worst possible way: HTTP 200, a valid PNG, with "API KEY
+  // REQUIRED" drawn across the image. Nothing downstream can tell that from a
+  // map, so it cached like one and the panel showed a wall of nag tiles.
+  //
+  // Esri's Canvas Dark/Light Gray Base fill the same role — deliberately quiet,
+  // so a marker on top is the loudest thing — and need no key. Note the path is
+  // {z}/{y}/{x}, y before x, which is Esri's order rather than a typo.
   readonly property string tileUrl: {
-    if (effectiveMapStyle === "Light") return "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
+    var esri = "https://server.arcgisonline.com/ArcGIS/rest/services/Canvas/"
+    if (effectiveMapStyle === "Light") return esri + "World_Light_Gray_Base/MapServer/tile/{z}/{y}/{x}"
     if (effectiveMapStyle === "OpenStreetMap") return "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
-    return "https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+    return esri + "World_Dark_Gray_Base/MapServer/tile/{z}/{y}/{x}"
   }
 
   // Whether what is about to be drawn is a pale map. Anything painted on top
