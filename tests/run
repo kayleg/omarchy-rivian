@@ -1,0 +1,61 @@
+#!/usr/bin/env bash
+# Every assertion here runs the real mapping over a saved gateway answer, so a
+# field Rivian renames breaks a test rather than silently blanking the panel.
+set -uo pipefail
+cd "$(dirname "$0")/.."
+RIVIAN=./bin/rivian
+pass=0; fail=0
+
+check() { # check NAME EXPECTED ACTUAL
+  if [ "$2" = "$3" ]; then pass=$((pass+1))
+  else fail=$((fail+1)); printf '  FAIL %s\n    expected: %s\n    actual:   %s\n' "$1" "$2" "$3"; fi
+}
+
+read_field() { $RIVIAN --units "$2" render < "tests/fixtures/$1" | jq -c "$3"; }
+
+echo "parked, imperial"
+check "range mi"      "179.6"   "$(read_field gateway-parked.json miles .range)"
+check "range unit"    '"mi"'    "$(read_field gateway-parked.json miles .range_unit)"
+check "odometer mi"   "13349"   "$(read_field gateway-parked.json miles .odometer)"
+check "inside °F"     "71"      "$(read_field gateway-parked.json miles .inside_temp)"
+check "state"         '"asleep"' "$(read_field gateway-parked.json miles .state)"
+check "not driving"   "false"   "$(read_field gateway-parked.json miles .driving)"
+check "locked"        "true"    "$(read_field gateway-parked.json miles .locked)"
+check "nothing open"  "[]"      "$(read_field gateway-parked.json miles .open)"
+check "not plugged"   "false"   "$(read_field gateway-parked.json miles .plugged)"
+# jq counts false as absent, so a legitimately-false boolean must survive.
+check "brake fluid"   "false"   "$(read_field gateway-parked.json miles .brake_fluid_low)"
+check "lat"           "37.7749" "$(read_field gateway-parked.json miles .lat)"
+
+echo "parked, metric"
+check "range km"      "289"     "$(read_field gateway-parked.json km .range)"
+check "odometer km"   "21483"   "$(read_field gateway-parked.json km .odometer)"
+check "inside °C"     "22"      "$(read_field gateway-parked.json km .inside_temp)"
+
+echo "driving"
+check "speed mph"     "65"      "$(read_field gateway-driving.json miles .speed)"
+check "speed km/h"    "105"     "$(read_field gateway-driving.json km .speed)"
+check "driving"       "true"    "$(read_field gateway-driving.json miles .driving)"
+check "state online"  '"online"' "$(read_field gateway-driving.json miles .state)"
+check "open grouped"  '["a door","the frunk"]' "$(read_field gateway-driving.json miles .open)"
+check "one low tyre"  "1"       "$(read_field gateway-driving.json miles .tyres.low)"
+check "brake fluid"   "true"    "$(read_field gateway-driving.json miles .brake_fluid_low)"
+
+echo "charging"
+check "charging now"  "true"    "$(read_field gateway-charging.json miles .charging_now)"
+check "plugged"       "true"    "$(read_field gateway-charging.json miles .plugged)"
+check "mins to full"  "47"      "$(read_field gateway-charging.json miles .minutes_to_full)"
+
+echo "sparse: a car the cloud has barely heard from"
+check "still ok"      "true"    "$(read_field gateway-sparse.json miles .ok)"
+check "state unknown" '"unknown"' "$(read_field gateway-sparse.json miles .state)"
+# Unknown must not render as unlocked.
+check "locked null"   "null"    "$(read_field gateway-sparse.json miles .locked)"
+check "no position"   "null"    "$(read_field gateway-sparse.json miles .lat)"
+check "no tyres"      "null"    "$(read_field gateway-sparse.json miles .tyres)"
+
+echo "shell"
+check "syntax" "ok" "$(bash -n $RIVIAN 2>/dev/null && echo ok)"
+
+printf '\n%d passed, %d failed\n' "$pass" "$fail"
+[ "$fail" -eq 0 ]

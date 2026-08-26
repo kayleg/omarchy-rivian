@@ -1,0 +1,34 @@
+omarchy-rivian
+==============
+
+This plugin is a port of omarchy-tesla by Jankees van Woezik, MIT licensed:
+
+    https://github.com/jankeesvw/omarchy-tesla
+    Copyright (c) 2026 Jankees van Woezik
+
+Carried over essentially unchanged:
+
+    MapView.qml                 tile rendering, marker, attribution
+    bin/rivian  cmd_map         Web Mercator tiling arithmetic
+    bin/rivian  fetch_tile      tile cache
+    bin/rivian  cmd_place       Nominatim reverse geocoding and its cache
+
+Carried over and adapted:
+
+    Panel.qml                   panel layout, wording, bar states, test hooks
+
+Written for this plugin:
+
+    bin/rivian                  everything else — Rivian's GraphQL gateway,
+                                its login and OTP flow, the vehicle-state
+                                query, and the mapping from Rivian's wire
+                                format onto the panel's reading
+    RivianMark.qml              the bar mark
+    manifest.json, tests/
+
+Field names for Rivian's undocumented app API came from the community's
+unofficial documentation at https://rivian-api.kaedenb.org/ and from
+rivian-python-api (https://github.com/the-mace/rivian-python-api), Apache-2.0.
+No code from either is included here.
+
+Not affiliated with or endorsed by Rivian Automotive, Inc. or Tesla, Inc.

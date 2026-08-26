@@ -1,0 +1,784 @@
+#!/usr/bin/env bash
+# rivian: read one Rivian, for the bar widget to call.
+#
+# Everything that talks to Rivian is here, so the QML never holds a credential
+# and never decides on its own to touch the car.
+#
+# The thing worth knowing up front, because it is the whole reason this script
+# is shorter than its Tesla cousin: **reading a Rivian never touches the car.**
+#
+# Tesla's owner API has two kinds of call — ones its servers answer, and ones
+# the car answers — and the second kind resets the car's sleep timer, which is
+# where the famous third-party vampire drain comes from. Rivian works the other
+# way round. The vehicle pushes telemetry up to Rivian's cloud on its own
+# schedule, and `vehicleState` reads whatever that cloud last heard. Every
+# field arrives with its own `timeStamp`, and the connection itself reports
+# `cloudConnection.lastSync`, which is exactly the shape you would expect of a
+# cache and not of a live poll.
+#
+# So there is no wake command here, no sleep policy, and no throttle protecting
+# the battery. The interval below is politeness to Rivian's gateway, nothing
+# more, and turning it down costs you nothing but their bandwidth.
+#
+# What you pay for that instead is a worse login. Tesla has an ecosystem of
+# little apps that run its real OAuth page and hand you a refresh token, so a
+# third-party tool never sees your password. Rivian has no such thing: the only
+# way in is to post the account's own email and password to the gateway and
+# answer an OTP. This script asks for both interactively, keeps neither, and
+# stores only the tokens that come back. See README's "Signing in" for what
+# that does and does not protect.
+
+set -uo pipefail
+
+readonly GATEWAY="https://rivian.com/api/gql/gateway/graphql"
+
+# Rivian serves the gateway only to something that looks like its own app.
+readonly CLIENT_NAME="com.rivian.ios.consumer-apollo-ios"
+readonly APP_UA="RivianApp/1304 CFNetwork/1404.0.5 Darwin/22.3.0"
+
+# Tiles and geocoding are somebody else's servers being generous, and both ask
+# for a user agent that says who is calling and where to complain. Only those
+# two get it; Rivian is told nothing but that this looks like a phone.
+readonly MAP_UA="omarchy-rivian/1.0 (+https://github.com/kayleg/omarchy-rivian)"
+
+CONFIG_DIR="${OMARCHY_RIVIAN_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/omarchy-rivian}"
+CACHE_DIR="${OMARCHY_RIVIAN_CACHE_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/omarchy-rivian}"
+
+# Seconds a reading is reused before the gateway is asked again. This is rate
+# limiting, not a sleep policy: see the note at the top. A car that is driving
+# gets a shorter one only because a stale position is the wrong answer when it
+# is moving, not because anything is at stake for the battery.
+MIN_INTERVAL=30
+DRIVE_INTERVAL=10
+VIN=""
+UNITS="auto"
+TILE_URL="https://basemaps.cartocdn.com/dark_all/{z}/{x}/{y}.png"
+FORCE=0
+
+die() { printf 'rivian: %s\n' "$*" >&2; exit 1; }
+
+# Every failure the widget might see comes back as JSON, so the panel can say
+# what went wrong instead of going blank on a parse error.
+fail_json() {
+  local error="${1:-not signed in}"
+  jq -cn --arg error "$error" --arg hint "${2-}" '{ok: false, error: $error, hint: $hint}'
+  exit 0
+}
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 is required but not installed"; }
+
+need curl
+need jq
+need awk
+
+# Both trees are private, and not only for the tokens. The cache is a record of
+# where the car has been: car.json carries the last position and the geocode
+# cache spells coordinates out in its own filenames, so an `ls` of it is a
+# movement log. The chmod covers installs that predate this.
+( umask 077; mkdir -p "$CONFIG_DIR" "$CACHE_DIR/tiles" "$CACHE_DIR/places" )
+chmod 700 "$CONFIG_DIR" "$CACHE_DIR" "$CACHE_DIR/tiles" "$CACHE_DIR/places" 2>/dev/null || true
+
+readonly SESSION="$CONFIG_DIR/session.json"
+
+now() { date +%s; }
+
+# Everything that reaches an arithmetic context goes through here first. Bash
+# does not treat $(( )) as a sum over strings: it re-reads the *contents* of
+# every name it finds there and evaluates those as arithmetic in turn, and an
+# array subscript met along the way is a command substitution. Rivian's answers
+# are as untrusted as any other here. Only plain digits get through.
+number_or() {
+  local value="$1" fallback="$2"
+  case "$value" in
+    ''|*[!0-9]*) printf '%s' "$fallback"; return 0 ;;
+  esac
+  [ "${#value}" -le 12 ] || { printf '%s' "$fallback"; return 0; }
+  printf '%s' "$((10#$value))"
+}
+
+write_private() {
+  local path="$1" tmp
+  tmp="$(mktemp "$path.XXXXXX")" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  cat > "$tmp" && mv -f "$tmp" "$path"
+}
+
+# A v4-shaped id for the Dc-Cid header. Rivian wants one per request and does
+# not check it against anything, so /dev/urandom is plenty and openssl is one
+# fewer dependency to insist on.
+uuid() {
+  if [ -r /proc/sys/kernel/random/uuid ]; then
+    cat /proc/sys/kernel/random/uuid
+  else
+    od -An -tx1 -N16 /dev/urandom | awk '{OFS="";$1=$1;
+      print substr($0,1,8)"-"substr($0,9,4)"-4"substr($0,14,3)"-a"substr($0,18,3)"-"substr($0,21,12)}'
+  fi
+}
+
+# ------------------------------------------------------------------- fixture
+
+# A canned reading, for working on the panel without waiting for the car to do
+# something interesting. Drop a reading in $CONFIG_DIR/fixture.json and `state`
+# and `car` serve that instead of asking Rivian anything at all; delete it and
+# both go back to the real car. A file rather than an environment variable
+# because the shell this feeds is already running, and a variable exported into
+# a terminal never reaches it.
+#
+# The timestamp is restamped on every call, so the panel's "fetched ... ago"
+# reads "just now" rather than counting up from whenever the file was written.
+fixture_path() { printf '%s' "$CONFIG_DIR/fixture.json"; }
+has_fixture() { [ -s "$(fixture_path)" ]; }
+
+# ---------------------------------------------------------------------- auth
+
+GQL_ERROR=""
+
+# One GraphQL POST. Extra headers come in as arguments so the login sequence,
+# which has no session yet, can send exactly what it has.
+gql() {
+  local body="$1"; shift
+  local response status
+  response=$(curl -sS -m 30 -w $'\n%{http_code}' \
+    -H "Content-Type: application/json" \
+    -H "Accept: application/json" \
+    -H "User-Agent: $APP_UA" \
+    -H "Apollographql-Client-Name: $CLIENT_NAME" \
+    -H "Dc-Cid: m-ios-$(uuid)" \
+    "$@" \
+    --data "$body" "$GATEWAY" 2>/dev/null)
+
+  status="${response##*$'\n'}"
+  response="${response%$'\n'*}"
+
+  if [ "$status" != "200" ]; then
+    GQL_ERROR="gateway said $status"
+    return 1
+  fi
+
+  # A GraphQL server answers 200 and puts the failure in the body, so the
+  # status code alone proves nothing.
+  local errors
+  errors=$(printf '%s' "$response" | jq -r '.errors[0].message // empty' 2>/dev/null)
+  if [ -n "$errors" ]; then
+    GQL_ERROR="$errors"
+    return 1
+  fi
+
+  printf '%s' "$response"
+}
+
+# Rivian gates the login mutations on a CSRF pair it mints for the asking. Both
+# halves travel as headers on every later call as well.
+csrf_pair() {
+  gql '{"operationName":"CreateCSRFToken","variables":{},"query":"mutation CreateCSRFToken { createCsrfToken { __typename csrfToken appSessionToken } }"}' \
+    | jq -c '.data.createCsrfToken | {csrf: .csrfToken, app: .appSessionToken}'
+}
+
+session_field() { jq -r --arg k "$1" '.[$k] // empty' "$SESSION" 2>/dev/null; }
+
+signed_in() { [ -s "$SESSION" ] && [ -n "$(session_field userSessionToken)" ]; }
+
+# The three headers that identify a signed-in caller.
+auth_headers() {
+  printf -- '-H\nCsrf-Token: %s\n-H\nA-Sess: %s\n-H\nU-Sess: %s\n' \
+    "$(session_field csrfToken)" "$(session_field appSessionToken)" "$(session_field userSessionToken)"
+}
+
+# An authenticated GraphQL call. Reads the header triple out of the session
+# file each time rather than caching it, so a refresh mid-run is picked up.
+api() {
+  local body="$1"
+  local -a headers=()
+  while IFS= read -r line; do headers+=("$line"); done < <(auth_headers)
+  gql "$body" "${headers[@]}"
+}
+
+cmd_login() {
+  local email password otp response kind
+
+  # A terminal is required. The panel never calls this: signing in is something
+  # a person does once, deliberately, at a prompt.
+  [ -t 0 ] || die "login needs a terminal; run it yourself in a shell"
+
+  printf 'Rivian account email: ' >&2
+  IFS= read -r email
+  [ -n "$email" ] || die "no email given"
+
+  # -s so it is not echoed, and it is never written anywhere.
+  printf 'Password: ' >&2
+  IFS= read -rs password
+  printf '\n' >&2
+  [ -n "$password" ] || die "no password given"
+
+  local pair csrf app
+  pair=$(csrf_pair) || die "could not start a session: $GQL_ERROR"
+  csrf=$(printf '%s' "$pair" | jq -r .csrf)
+  app=$(printf '%s' "$pair" | jq -r .app)
+
+  local login_body
+  login_body=$(jq -cn --arg e "$email" --arg p "$password" '{
+    operationName: "Login",
+    variables: {email: $e, password: $p},
+    query: "mutation Login($email: String!, $password: String!) { login(email: $email, password: $password) { __typename ... on MobileLoginResponse { __typename accessToken refreshToken userSessionToken } ... on MobileMFALoginResponse { __typename otpToken } } }"
+  }')
+
+  response=$(gql "$login_body" -H "Csrf-Token: $csrf" -H "A-Sess: $app") \
+    || die "login failed: $GQL_ERROR"
+  password=""
+
+  kind=$(printf '%s' "$response" | jq -r '.data.login.__typename // empty')
+
+  if [ "$kind" = "MobileMFALoginResponse" ]; then
+    local otp_token
+    otp_token=$(printf '%s' "$response" | jq -r '.data.login.otpToken')
+
+    printf 'Rivian sent a code. Enter it: ' >&2
+    IFS= read -r otp
+    [ -n "$otp" ] || die "no code given"
+
+    local otp_body
+    otp_body=$(jq -cn --arg e "$email" --arg c "$otp" --arg t "$otp_token" '{
+      operationName: "LoginWithOTP",
+      variables: {email: $e, otpCode: $c, otpToken: $t},
+      query: "mutation LoginWithOTP($email: String!, $otpCode: String!, $otpToken: String!) { loginWithOTP(email: $email, otpCode: $otpCode, otpToken: $otpToken) { __typename ... on MobileLoginResponse { __typename accessToken refreshToken userSessionToken } } }"
+    }')
+
+    response=$(gql "$otp_body" -H "Csrf-Token: $csrf" -H "A-Sess: $app") \
+      || die "the code was not accepted: $GQL_ERROR"
+    response=$(printf '%s' "$response" | jq -c '{data: {login: .data.loginWithOTP}}')
+  fi
+
+  local user_session
+  user_session=$(printf '%s' "$response" | jq -r '.data.login.userSessionToken // empty')
+  [ -n "$user_session" ] || die "signed in but got no session token back"
+
+  printf '%s' "$response" | jq -c \
+    --arg csrf "$csrf" --arg app "$app" --arg at "$(now)" '{
+      csrfToken: $csrf,
+      appSessionToken: $app,
+      accessToken: .data.login.accessToken,
+      refreshToken: .data.login.refreshToken,
+      userSessionToken: .data.login.userSessionToken,
+      at: ($at|tonumber)
+    }' | write_private "$SESSION"
+
+  printf 'Signed in. Tokens are in %s, readable only by you.\n' "$SESSION" >&2
+
+  # Name the cars straight away: it is the cheapest possible proof that the
+  # session actually works, and it tells you the VIN you may need to set.
+  cmd_vehicles
+}
+
+cmd_logout() {
+  rm -f "$SESSION"
+  printf 'Signed out. %s removed.\n' "$SESSION" >&2
+  printf 'The position cache in %s is left alone; delete it too if you want the history gone.\n' "$CACHE_DIR" >&2
+}
+
+# ------------------------------------------------------------------ vehicles
+
+# Only the part of getUserInfo that names cars. The full query the app sends
+# drags in enrolled phone keys, pending invites and build dates, none of which
+# a bar widget has any business holding.
+readonly VEHICLES_QUERY='{"operationName":"getUserInfo","variables":{},"query":"query getUserInfo { currentUser { __typename id vehicles { __typename id name vin vehicle { __typename id vin modelYear make model } } } }"}'
+
+vehicles_json() {
+  signed_in || { GQL_ERROR="not signed in"; return 1; }
+  api "$VEHICLES_QUERY" | jq -c '[.data.currentUser.vehicles[]? | {
+    id: .id,
+    vin: .vin,
+    name: (if (.name // "") == "" then "Rivian" else .name end),
+    model: (.vehicle.model // ""),
+    year: (.vehicle.modelYear // null)
+  }]'
+}
+
+cmd_vehicles() {
+  local list
+  list=$(vehicles_json) || fail_json "$GQL_ERROR" "$(auth_hint)"
+  printf '%s' "$list" | jq -r '.[] | "  \(.name)  \(.vin)  \(.year // "") \(.model)"' >&2
+  printf '%s\n' "$list"
+}
+
+# Which car this widget is about. A VIN pins it; without one the first car on
+# the account wins, which is the right answer for almost everybody.
+pick_vehicle() {
+  local list="$1"
+  if [ -n "$VIN" ]; then
+    printf '%s' "$list" | jq -c --arg vin "$VIN" '.[] | select(.vin == $vin)' | head -1
+  else
+    printf '%s' "$list" | jq -c '.[0] // empty'
+  fi
+}
+
+auth_hint() {
+  if ! signed_in; then
+    printf 'run: %s login' "$0"
+  else
+    case "$GQL_ERROR" in
+      *[Uu]nauthor*|*[Ss]ession*|*401*|*403*) printf 'the session expired; run: %s login' "$0" ;;
+      *) printf '' ;;
+    esac
+  fi
+}
+
+# --------------------------------------------------------------------- state
+
+# Everything the panel shows, in one query. Rivian answers all of it from its
+# own cloud, so there is no cheap-versus-expensive split to make here the way
+# there is with Tesla: asking for the lot costs exactly what asking for the
+# power state costs.
+readonly STATE_FIELDS='cloudConnection { lastSync } powerState { timeStamp value } driveMode { value } gearStatus { timeStamp value } vehicleMileage { value } batteryLevel { value } batteryLimit { value } distanceToEmpty { value } gnssLocation { latitude longitude timeStamp } gnssSpeed { value } gnssBearing { value } chargerState { value } chargerStatus { value } timeToEndOfCharge { value } cabinClimateInteriorTemperature { value } doorFrontLeftLocked { value } doorFrontLeftClosed { value } doorFrontRightLocked { value } doorFrontRightClosed { value } doorRearLeftLocked { value } doorRearLeftClosed { value } doorRearRightLocked { value } doorRearRightClosed { value } windowFrontLeftClosed { value } windowFrontRightClosed { value } windowRearLeftClosed { value } windowRearRightClosed { value } closureFrunkClosed { value } closureLiftgateClosed { value } closureTailgateClosed { value } closureTonneauClosed { value } gearGuardLocked { value } alarmSoundStatus { value } tirePressureStatusFrontLeft { value } tirePressureStatusFrontRight { value } tirePressureStatusRearLeft { value } tirePressureStatusRearRight { value } wiperFluidState { value } brakeFluidLow { value } otaCurrentVersion { value } otaAvailableVersion { value } otaStatus { value } otaInstallProgress { value }'
+
+state_query() {
+  jq -cn --arg id "$1" --arg fields "$STATE_FIELDS" '{
+    operationName: "GetVehicleState",
+    variables: {vehicleID: $id},
+    query: ("query GetVehicleState($vehicleID: String!) { vehicleState(id: $vehicleID) { __typename " + $fields + " } }")
+  }'
+}
+
+# Whether the units are miles or kilometres. Rivian reports metric on the wire
+# whatever the car's own screen is set to, and — unlike Tesla — does not report
+# which the screen shows, so there is nothing to follow and this has to be a
+# setting. Auto reads the locale, which is right for the overwhelming majority
+# and wrong quietly rather than confusingly.
+imperial() {
+  case "$UNITS" in
+    imperial|miles|mi) return 0 ;;
+    metric|km|kilometres|kilometers) return 1 ;;
+  esac
+  case "${LC_MEASUREMENT:-${LC_ALL:-${LANG:-}}}" in
+    *en_US*|*en_GB*|*en_MM*|*en_LR*|C|C.*|POSIX|'') return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ------------------------------------------------------------------ readings
+
+# Rivian's wire format is metric and stringly-typed: distances in metres and
+# kilometres, temperatures in Celsius, and closures reported as the words
+# "open" and "closed" rather than as booleans. All of that is normalised here,
+# so nothing downstream has to know which car this is — the panel reads the
+# same shape it would read from a Tesla.
+reading_json() {
+  local raw="$1" name="$2" vin="$3" model="$4" year="$5" fresh="$6"
+  local mi=false; imperial && mi=true
+
+  printf '%s' "$raw" | jq -c \
+    --argjson mi "$mi" --argjson fresh "$fresh" --arg at "$(now)" \
+    --arg name "$name" --arg vin "$vin" --arg model "$model" --arg year "$year" '
+    (.data.vehicleState // .vehicleState // .) as $s
+    # Every reading is {value, timeStamp} or absent. This unwraps one safely:
+    # a field the account has no sensor for comes back null rather than
+    # exploding the whole document.
+    # `.value // null` would be wrong here: jq counts false as absent, so a
+    # boolean field that is legitimately false — brakeFluidLow on a car whose
+    # brake fluid is fine — would read as "no such sensor" instead of "no".
+    | (def v($f): (if ($f|type) == "object" and ($f|has("value")) then $f.value else null end);
+       # km -> display, metres -> display, C -> display
+       (if $mi then 0.621371 else 1 end) as $kmc
+     | (if $mi then 1609.344 else 1000 end) as $mc
+     | (if $mi then "mi" else "km" end) as $dist
+     | (if $mi then "mph" else "km/h" end) as $speed
+     | (if $mi then "°F" else "°C" end) as $tunit
+     | v($s.gearStatus) as $gear
+     | v($s.powerState) as $power
+     | v($s.chargerState) as $charger
+     # A closure is open unless it says "closed". Reading it the other way
+     # round — open only when it says "open" — would call a field Rivian has
+     # stopped populating closed, and a widget that quietly stops mentioning
+     # the open frunk is worse than one that never mentioned it.
+     | (def shut($f): (v($f) // "closed") == "closed";
+        [(if (shut($s.doorFrontLeftClosed) and shut($s.doorFrontRightClosed)
+              and shut($s.doorRearLeftClosed) and shut($s.doorRearRightClosed))
+          then empty else "a door" end),
+         (if shut($s.closureFrunkClosed) then empty else "the frunk" end),
+         (if shut($s.closureLiftgateClosed) then empty else "the liftgate" end),
+         (if shut($s.closureTailgateClosed) then empty else "the tailgate" end),
+         (if shut($s.closureTonneauClosed) then empty else "the tonneau" end),
+         (if (shut($s.windowFrontLeftClosed) and shut($s.windowFrontRightClosed)
+              and shut($s.windowRearLeftClosed) and shut($s.windowRearRightClosed))
+          then empty else "a window" end)]) as $open
+     # Rivian reports tyres as a judgement, not a pressure: each corner is OK,
+     # low, or not currently known. There is no number to show, so the panel
+     # gets the verdict and the count of corners that disagree with it.
+     | ([$s.tirePressureStatusFrontLeft, $s.tirePressureStatusFrontRight,
+         $s.tirePressureStatusRearLeft, $s.tirePressureStatusRearRight]
+        | map(.value // empty) | map(ascii_downcase)) as $tp
+     | ($tp | map(select(. == "low" or . == "lo")) | length) as $tp_low
+     | {ok: true,
+        fresh: $fresh,
+        at: ($at|tonumber),
+        name: $name,
+        vin: $vin,
+        model: $model,
+        year: (if $year == "" then null else ($year|tonumber?) end),
+
+        # sleep / standby / ready / go. The panel only needs to know whether
+        # the cloud has heard from it lately, which lastSync answers better.
+        power: $power,
+        state: (if $power == "sleep" or $power == "standby" then "asleep"
+                elif $power == null then "unknown" else "online" end),
+        last_sync: ($s.cloudConnection.lastSync // null),
+
+        lat: $s.gnssLocation.latitude,
+        lon: $s.gnssLocation.longitude,
+        gps_as_of: ($s.gnssLocation.timeStamp // null),
+        heading: v($s.gnssBearing),
+        shift: ($gear // "park"),
+        driving: (($gear // "park") != "park"),
+        # Metres per hour on the wire, which is a strange unit to pick and the
+        # reason this looks like a no-op in metric.
+        speed: (if v($s.gnssSpeed) == null then null
+                else (v($s.gnssSpeed) / $mc | round) end),
+        speed_unit: $speed,
+        drive_mode: v($s.driveMode),
+
+        battery: v($s.batteryLevel),
+        charge_limit: v($s.batteryLimit),
+        charging: ($charger // "unknown"),
+        plugged: ((v($s.chargerStatus) // "") | test("not_connected") | not),
+        charging_now: (($charger // "") == "charging_active"),
+        minutes_to_full: v($s.timeToEndOfCharge),
+        range: (if v($s.distanceToEmpty) == null then null
+                else (v($s.distanceToEmpty) * $kmc * 10 | round / 10) end),
+        range_unit: $dist,
+        odometer: (if v($s.vehicleMileage) == null then null
+                   else (v($s.vehicleMileage) / $mc | round) end),
+
+        # Null rather than false when the cloud has not heard: "unlocked" and
+        # "no idea" are different answers, and a panel that renders the second
+        # as the first is telling you the car is open when it is not.
+        locked: (if v($s.doorFrontLeftLocked) == null then null
+                 else ((v($s.doorFrontLeftLocked) == "locked")
+                       and ((v($s.doorFrontRightLocked) // "locked") == "locked")) end),
+        gear_guard: (if v($s.gearGuardLocked) == null then null
+                     else v($s.gearGuardLocked) == "locked" end),
+        alarm: v($s.alarmSoundStatus),
+
+        inside_temp: (if v($s.cabinClimateInteriorTemperature) == null then null
+                      else (if $mi then v($s.cabinClimateInteriorTemperature) * 1.8 + 32
+                            else v($s.cabinClimateInteriorTemperature) end | round) end),
+        temp_unit: $tunit,
+
+        tyres: (if ($tp | length) == 0 then null
+                else {low: $tp_low, known: ($tp | map(select(. != "unknown")) | length)} end),
+        wiper_fluid: v($s.wiperFluidState),
+        brake_fluid_low: v($s.brakeFluidLow),
+
+        software: v($s.otaCurrentVersion),
+        software_available: v($s.otaAvailableVersion),
+        ota_status: v($s.otaStatus),
+        ota_progress: v($s.otaInstallProgress),
+        open: $open})'
+}
+
+# One reading, cached. `state` and `car` share this, so a bar that polls every
+# few minutes and a panel opened between polls cost one call between them
+# rather than one each.
+CAR_CACHE=""
+read_car() {
+  CAR_CACHE="$CACHE_DIR/car.json"
+
+  if has_fixture; then
+    jq -c --arg at "$(now)" '. + {at: ($at|tonumber), fresh: false, fixture: true}' "$(fixture_path)"
+    return 0
+  fi
+
+  # How stale a cached reading may be. A moving car gets a shorter window
+  # because a stale position is the wrong answer, not because anything is at
+  # stake for the battery — see the note at the top of this file.
+  local interval="$MIN_INTERVAL"
+  if [ -s "$CAR_CACHE" ] && [ "$(jq -r '.driving // false' "$CAR_CACHE" 2>/dev/null)" = "true" ]; then
+    interval="$DRIVE_INTERVAL"
+  fi
+
+  if [ "$FORCE" -eq 0 ] && [ -s "$CAR_CACHE" ]; then
+    local age
+    age=$(( $(now) - $(number_or "$(jq -r '.at // 0' "$CAR_CACHE" 2>/dev/null)" 0) ))
+    if [ "$age" -ge 0 ] && [ "$age" -lt "$interval" ]; then
+      jq -c '. + {fresh: false}' "$CAR_CACHE"
+      return 0
+    fi
+  fi
+
+  local list vehicle
+  list=$(vehicles_json) || { serve_cache_or_fail "$GQL_ERROR"; return $?; }
+  vehicle=$(pick_vehicle "$list")
+  if [ -z "$vehicle" ]; then
+    if [ -n "$VIN" ]; then
+      serve_cache_or_fail "no car on this account with VIN $VIN"
+    else
+      serve_cache_or_fail "this account has no cars on it"
+    fi
+    return $?
+  fi
+
+  local id raw
+  id=$(printf '%s' "$vehicle" | jq -r .id)
+  raw=$(api "$(state_query "$id")") || { serve_cache_or_fail "$GQL_ERROR"; return $?; }
+
+  local reading
+  reading=$(reading_json "$raw" \
+    "$(printf '%s' "$vehicle" | jq -r .name)" \
+    "$(printf '%s' "$vehicle" | jq -r .vin)" \
+    "$(printf '%s' "$vehicle" | jq -r .model)" \
+    "$(printf '%s' "$vehicle" | jq -r '.year // ""')" \
+    true)
+
+  # A reading that did not parse is not worth caching over a good one.
+  if [ -z "$reading" ] || [ "$(printf '%s' "$reading" | jq -r '.ok // false')" != "true" ]; then
+    serve_cache_or_fail "Rivian answered with something unreadable"
+    return $?
+  fi
+
+  printf '%s' "$reading" | write_private "$CAR_CACHE"
+  printf '%s\n' "$reading"
+}
+
+# A car that cannot be reached now was somewhere the last time it could be.
+# Showing that, marked stale, beats blanking the panel: the position of a
+# parked car does not stop being true because the network went away.
+serve_cache_or_fail() {
+  local error="$1"
+  if [ -s "$CAR_CACHE" ]; then
+    jq -c --arg error "$error" '. + {fresh: false, stale: true, error: $error}' "$CAR_CACHE"
+    return 0
+  fi
+  fail_json "$error" "$(auth_hint)"
+}
+
+cmd_car() { read_car; }
+
+# The mapping on its own, over a gateway answer on stdin. This is how the field
+# mapping is tested without an account, and it is the useful thing to run when
+# Rivian changes a field name: save what the gateway said, pipe it in here, and
+# the difference between the two is the bug.
+cmd_render() {
+  local raw
+  raw=$(cat)
+  reading_json "$raw" "${1:-Rivian}" "${2:-FIXTUREVIN}" "${3:-R1S}" "${4:-2025}" true
+}
+
+# What the bar itself shows. The same reading, projected down to the handful of
+# fields the icon needs, so the bar and the panel never disagree.
+cmd_state() {
+  read_car | jq -c '{ok: (.ok // false), error: (.error // null), hint: (.hint // null),
+                     at: .at, fresh: .fresh, stale: (.stale // false), fixture: (.fixture // false),
+                     state: .state, power: .power, name: .name, vin: .vin,
+                     battery: .battery, range: .range, range_unit: .range_unit,
+                     driving: .driving, speed: .speed, speed_unit: .speed_unit,
+                     charging_now: .charging_now, plugged: .plugged, last_sync: .last_sync}'
+}
+
+# ----------------------------------------------------------------------- map
+#
+# Web Mercator tiling, tile caching and reverse geocoding, carried over
+# essentially unchanged from omarchy-tesla (MIT, Jankees van Woezik). None of it
+# knows or cares what make the car is.
+
+cmd_map() {
+  local lat="$1" lon="$2" zoom="$3" width="$4" height="$5"
+
+  case "$lat$lon$zoom$width$height" in
+    *[!0-9.\-]*) fail_json "map wants numbers" ;;
+  esac
+
+  local plan
+  plan=$(awk -v lat="$lat" -v lon="$lon" -v z="$zoom" -v w="$width" -v h="$height" '
+    BEGIN {
+      pi = 3.14159265358979
+      size = 256
+      n = 2 ^ z
+      rad = lat * pi / 180
+      # Web Mercator: longitude is linear, latitude runs through the log-tangent.
+      fx = (lon + 180) / 360 * n
+      fy = (1 - log((sin(rad) / cos(rad)) + (1 / cos(rad))) / pi) / 2 * n
+
+      # Where the car sits in world pixels, and the window we want around it.
+      cx = fx * size
+      cy = fy * size
+      left = cx - w / 2
+      top  = cy - h / 2
+
+      x0 = int(left / size); if (left < 0 && left != x0 * size) x0--
+      y0 = int(top  / size); if (top  < 0 && top  != y0 * size) y0--
+      x1 = int((left + w - 1) / size); if ((left + w - 1) < 0) x1--
+      y1 = int((top  + h - 1) / size); if ((top  + h - 1) < 0) y1--
+
+      # The car is dead centre by construction; printing it keeps the QML from
+      # having to trust that.
+      printf "car %d %d\n", int(w / 2 + 0.5), int(h / 2 + 0.5)
+
+      for (ty = y0; ty <= y1; ty++) {
+        for (tx = x0; tx <= x1; tx++) {
+          # Off the top or bottom of the world there is no tile; wrap around
+          # the date line rather than asking for a column that does not exist.
+          if (ty < 0 || ty >= n) continue
+          wx = tx % n; if (wx < 0) wx += n
+          printf "tile %d %d %d %d\n", wx, ty, int(tx * size - left + 0.5), int(ty * size - top + 0.5)
+        }
+      }
+    }')
+
+  local car_x car_y
+  car_x=$(printf '%s' "$plan" | awk '/^car/ {print $2}')
+  car_y=$(printf '%s' "$plan" | awk '/^car/ {print $3}')
+
+  local tiles="[]"
+  while read -r _ tx ty px py; do
+    [ -n "${tx:-}" ] || continue
+    local path
+    path=$(fetch_tile "$zoom" "$tx" "$ty") || continue
+    tiles=$(printf '%s' "$tiles" | jq -c --arg path "$path" --argjson px "$px" --argjson py "$py" \
+      '. + [{path: $path, x: $px, y: $py}]')
+  done < <(printf '%s' "$plan" | grep '^tile')
+
+  jq -cn --argjson tiles "$tiles" --argjson w "$width" --argjson h "$height" \
+    --argjson cx "${car_x:-0}" --argjson cy "${car_y:-0}" --argjson z "$zoom" '
+    {ok: true, width: $w, height: $h, zoom: $z, tileSize: 256,
+     carX: $cx, carY: $cy, tiles: $tiles,
+     attribution: "© OpenStreetMap contributors © CARTO"}'
+}
+
+# Tiles are immutable for practical purposes, so one that is on disk is never
+# fetched again. This is the whole of being a good guest on a free tile server.
+fetch_tile() {
+  local z="$1" x="$2" y="$3"
+  local dir="$CACHE_DIR/tiles/$(printf '%s' "$TILE_URL" | md5sum | cut -c1-8)/$z/$x"
+  local path="$dir/$y.png"
+
+  if [ -s "$path" ]; then printf '%s' "$path"; return 0; fi
+
+  ( umask 077; mkdir -p "$dir" )
+  local url="${TILE_URL//\{z\}/$z}"
+  url="${url//\{x\}/$x}"
+  url="${url//\{y\}/$y}"
+
+  if curl -sS -f -m 20 -A "$MAP_UA" -o "$path.part" "$url" 2>/dev/null && [ -s "$path.part" ]; then
+    mv -f "$path.part" "$path"
+    printf '%s' "$path"
+    return 0
+  fi
+
+  rm -f "$path.part"
+  return 1
+}
+
+# Where the car is, in words. Nominatim asks for no more than one call a
+# second and would rather you cached; coordinates are rounded to about ten
+# metres first, so a car sitting still is one lookup however often you look.
+cmd_place() {
+  local lat="$1" lon="$2"
+  local key path response
+
+  # Same check `map` makes. These are pasted straight into a query string, and
+  # a coordinate that is not a number is not a coordinate.
+  case "$lat$lon" in
+    *[!0-9.\-]*|'') fail_json "place wants numbers"; return 0 ;;
+  esac
+
+  key=$(awk -v a="$lat" -v b="$lon" 'BEGIN { printf "%.4f_%.4f", a, b }')
+  path="$CACHE_DIR/places/$key.json"
+
+  if [ -s "$path" ]; then cat "$path"; return 0; fi
+
+  response=$(curl -sS -f -m 20 -A "$MAP_UA" \
+    "https://nominatim.openstreetmap.org/reverse?format=jsonv2&zoom=18&lat=$lat&lon=$lon" 2>/dev/null) \
+    || fail_json "no address"
+
+  # A street and a town is what you want to read; the full display_name is a
+  # paragraph ending in the country you are standing in.
+  #
+  # The house number comes back on its own as well as folded into `place`,
+  # because it is worth having when the car is parked and noise when it is
+  # moving: at speed the nearest address changes every second and the line
+  # flickers through numbers nobody is reading.
+  printf '%s' "$response" | jq -c '
+    .address as $a
+    | ($a.road // $a.pedestrian // $a.footway // "") as $road
+    | ($a.house_number // "") as $number
+    | ($a.village // $a.town // $a.city // $a.suburb // $a.municipality // "") as $town
+    | {ok: true,
+       street: $road,
+       number: $number,
+       town: $town,
+       place: ([[$road, $number] | map(select(. != "")) | join(" "), $town]
+               | map(select(. != "")) | join(", "))}' | write_private "$path"
+
+  cat "$path"
+}
+
+# ------------------------------------------------------------------- options
+
+usage() {
+  cat <<'EOF'
+rivian: read one Rivian.
+
+  login                     sign in. Asks for the account email, password and OTP
+  logout                    forget the tokens on this machine
+  vehicles                  the cars on the account, with their VINs
+  state                     the summary the bar icon shows
+  car [--force]             everything the panel shows
+  render [NAME VIN MODEL YEAR]  map a saved gateway answer on stdin to a reading
+  map LAT LON ZOOM W H      map tiles around a point, fetched and cached
+  place LAT LON             that point as a street and a town
+
+Reading a Rivian never touches the car: the vehicle pushes telemetry to
+Rivian's cloud and this reads the cloud. There is no wake command and no sleep
+policy, because there is nothing here that can keep a car awake.
+
+A reading in ~/.config/omarchy-rivian/fixture.json overrides `state` and `car`
+entirely, for working on the panel without the car moving under you. Delete the
+file to go back to the real car.
+
+Options:
+  --vin VIN                 pick a car, when the account has more than one
+  --units auto|miles|km     auto follows the locale (default)
+  --min-interval SECONDS    how long a reading is reused (default 30)
+  --tile-url URL            {z}/{x}/{y} template for map tiles
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --vin) VIN="${2-}"; shift 2 ;;
+    --units) UNITS="${2-}"; shift 2 ;;
+    --min-interval) MIN_INTERVAL=$(number_or "${2-}" 30); shift 2 ;;
+    --tile-url) TILE_URL="${2-}"; shift 2 ;;
+    --force) FORCE=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    --) shift; break ;;
+    -*) die "unknown option $1" ;;
+    *) break ;;
+  esac
+done
+
+[ $# -gt 0 ] || { usage; exit 1; }
+
+command="$1"; shift
+
+# Options are read again after the command, because `car --force` is how
+# anybody would write it and the loop above stops at the first word that is not
+# an option.
+rest=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --force) FORCE=1; shift ;;
+    *) rest+=("$1"); shift ;;
+  esac
+done
+set -- ${rest[@]+"${rest[@]}"}
+
+case "$command" in
+  login)    cmd_login ;;
+  logout)   cmd_logout ;;
+  vehicles) cmd_vehicles ;;
+  state)    cmd_state ;;
+  car)      cmd_car ;;
+  render)   cmd_render "$@" ;;
+  map)      [ $# -eq 5 ] || die "map wants LAT LON ZOOM WIDTH HEIGHT"; cmd_map "$@" ;;
+  place)    [ $# -eq 2 ] || die "place wants LAT LON"; cmd_place "$@" ;;
+  *)        die "unknown command $command" ;;
+esac

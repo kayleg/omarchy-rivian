@@ -1,0 +1,98 @@
+{
+  "schemaVersion": 1,
+  "id": "kayleg.rivian",
+  "name": "Rivian",
+  "version": "1.0.0",
+  "author": "kayleg",
+  "description": "Your Rivian in the bar: where it is, how full it is, and how far that gets you",
+  "homepage": "https://github.com/kayleg/omarchy-rivian",
+  "license": "MIT",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "Panel.qml" },
+  "barWidget": {
+    "displayName": "Rivian",
+    "description": "Your Rivian in the bar: where it is, how full it is, and how far that gets you",
+    "category": "Home",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "vin": "",
+      "panelWidth": 380,
+      "mapZoom": 16,
+      "mapStyle": "Auto",
+      "units": "Auto",
+      "statePollMinutes": 5,
+      "showAddress": true,
+      "mapsUrl": "https://www.google.com/maps/search/?api=1&query={lat},{lon}"
+    },
+    "schema": [
+      {
+        "key": "vin",
+        "type": "string",
+        "label": "VIN",
+        "defaultValue": "",
+        "description": "Which car, when the account has more than one. Empty picks the first one Rivian lists, which is the right answer for almost everybody. `bin/rivian vehicles` prints the VINs on the account."
+      },
+      {
+        "key": "units",
+        "type": "enum",
+        "label": "Units",
+        "options": ["Auto", "Miles", "Kilometres"],
+        "defaultValue": "Auto",
+        "description": "Rivian reports metric on the wire whatever the car's own screen shows, and — unlike Tesla — does not say which the screen is set to, so there is nothing to follow and this has to be asked. Auto reads your locale, which is right for almost everybody."
+      },
+      {
+        "key": "mapStyle",
+        "type": "enum",
+        "label": "Map",
+        "options": ["Auto", "Dark", "Light", "OpenStreetMap"],
+        "defaultValue": "Auto",
+        "description": "Auto follows your theme: a light theme gets CARTO's light basemap, a dark one gets its dark basemap. Both are quiet enough to read a marker off, which is why they beat OpenStreetMap's own standard style here. That one is the map everybody recognises, and considerably louder behind a marker."
+      },
+      {
+        "key": "mapZoom",
+        "type": "integer",
+        "label": "Zoom",
+        "min": 3,
+        "max": 19,
+        "step": 1,
+        "defaultValue": 16,
+        "description": "16 shows the street the car is on and the ones either side, which is the level at which you can tell whether it is where you left it. Lower to see which town, higher to see which parking space."
+      },
+      {
+        "key": "panelWidth",
+        "type": "integer",
+        "label": "Panel width",
+        "min": 300,
+        "max": 900,
+        "step": 20,
+        "defaultValue": 380,
+        "description": "In the shell's spacing units. The map is this wide and everything else is measured off it, so this one number sizes the whole panel. Anything wider than the screen is trimmed to fit."
+      },
+      {
+        "key": "showAddress",
+        "type": "boolean",
+        "label": "Look the position up by name",
+        "defaultValue": true,
+        "description": "Turns the coordinates into a street and a town, through OpenStreetMap's Nominatim. Answers are cached per position, so a parked car is one lookup however often you look at it. Off if you would rather nothing but Rivian learned where the car is."
+      },
+      {
+        "key": "statePollMinutes",
+        "type": "integer",
+        "label": "Check on the car every",
+        "min": 1,
+        "max": 60,
+        "step": 1,
+        "defaultValue": 5,
+        "description": "Minutes. Rivian answers this from its own cloud and the car is never involved, so unlike the equivalent Tesla setting this costs the battery nothing at any interval — it is politeness to Rivian's gateway and nothing more. It is what lights the bar icon."
+      },
+      {
+        "key": "mapsUrl",
+        "type": "string",
+        "label": "Where a click on the map goes",
+        "defaultValue": "https://www.google.com/maps/search/?api=1&query={lat},{lon}",
+        "description": "The address opened when you click the map, with {lat} and {lon} standing in for the position. Google Maps by default because that is what most people navigate with; https://www.openstreetmap.org/?mlat={lat}&mlon={lon}#map=17/{lat}/{lon} keeps it in OpenStreetMap."
+      }
+    ]
+  }
+}
